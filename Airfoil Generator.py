@@ -5,127 +5,153 @@ Scans a "data/" folder (next to this script) for .dat files and lists
 them in a dropdown. Selecting one and clicking OK creates a closed
 spline sketch on the XY plane.
 
-Supports both Selig and Lednicer .dat formats.
+Features
+--------
+- Supports both Selig and Lednicer .dat formats.
+- Automatic point interpolation ensures minimum curve fidelity
+  (default: spline points every 2.5 mm along X).
+- Optional control-surface split line at a configurable chord percentage
+  (default: 75 %).
+
 To add airfoils: drop any .dat file into the data/ folder and re-run.
 
 Run via: Tools > Add-Ins > Scripts and Add-Ins > "+" > select file > Run
 """
 
 import os
+import sys
+import importlib
+import traceback
 import adsk.core
 import adsk.fusion
-import traceback
 
 _EMPTY_LOCAL = "(no local airfoils - add .dat files to the data/ folder)"
 
 _app      = None
 _handlers = []
+Utils     = None
+
+# Unit conversion
+_MM_PER_CM = 10.0
+
+# Defaults
+_DEFAULT_SPLIT_PCT        = 75.0
+_DEFAULT_OFFSET_MM        = 2.0
+_DEFAULT_SPAR_DIAMETER_MM  = 15.5
+_DEFAULT_SPAR_CLEARANCE_MM = 3.0
 
 
-# -- .dat File Parsing ---------------------------------------------------------
+# -- Drawing Helpers -----------------------------------------------------------
 
-def parse_dat_file(filepath):
-    """
-    Parse a Selig or Lednicer format .dat file.
+def _draw_polyline(sketch, contour, chord_cm, closed=True):
+    """Draw line segments connecting *contour* on *sketch*."""
+    lines = sketch.sketchCurves.sketchLines
+    n = len(contour)
+    end = n if closed else n - 1
+    sketch.isComputeDeferred = True
+    for i in range(end):
+        x0, y0 = contour[i]
+        x1, y1 = contour[(i + 1) % n]
+        lines.addByTwoPoints(
+            adsk.core.Point3D.create(x0 * chord_cm, y0 * chord_cm, 0.0),
+            adsk.core.Point3D.create(x1 * chord_cm, y1 * chord_cm, 0.0),
+        )
+    sketch.isComputeDeferred = False
 
-    Selig format  : name on line 1, then x y pairs going TE->upper->LE->lower->TE
-    Lednicer format: name on line 1, point counts on line 2, then upper surface
-                     (LE->TE) followed by lower surface (LE->TE)
 
-    Returns (name: str, coords: [(x, y), ...])
-    """
-    with open(filepath, "r") as fh:
-        raw_lines = fh.readlines()
+def _draw_offset(sketch, contour, chord_cm, offset_mm):
+    """Draw an inward-offset closed polyline from *contour*."""
+    offset_norm = offset_mm / (chord_cm * _MM_PER_CM)
+    off_pts = Utils.offset_contour(contour, offset_norm)
+    _draw_polyline(sketch, off_pts, chord_cm)
 
-    if not raw_lines:
-        raise ValueError(f"Empty file: {filepath}")
 
-    name = raw_lines[0].strip()
+def _draw_spar_holes(sketch, coords, chord_cm, spar_diam_cm, clearance_mm,
+                      max_x_frac):
+    """Auto-place spar holes for maximum separation. Returns info string."""
+    chord_mm = chord_cm * _MM_PER_CM
+    spar_diam_norm = spar_diam_cm / chord_cm
+    clearance_norm = clearance_mm / chord_mm
 
-    # Collect non-empty data lines after the header
-    data_lines = [l.strip() for l in raw_lines[1:] if l.strip()]
-
-    if not data_lines:
-        raise ValueError(f"No coordinate data in {filepath!r}")
-
-    def try_floats(line):
-        try:
-            return [float(t) for t in line.split()]
-        except ValueError:
-            return []
-
-    first_vals = try_floats(data_lines[0])
-
-    # Lednicer detection: first data line has exactly 2 tokens, both are
-    # whole numbers >= 2 (they are point counts, e.g. "17.   17.")
-    is_lednicer = (
-        len(first_vals) == 2
-        and all(v == int(v) and v >= 2 for v in first_vals)
+    spars = Utils.find_optimal_spar_positions(
+        coords, spar_diam_norm, clearance_norm, max_x_frac,
     )
 
-    if is_lednicer:
-        n_upper = int(first_vals[0])
-        n_lower = int(first_vals[1])
-        coord_lines = data_lines[1:]
+    if not spars:
+        return (
+            f"\n    Spars    : could not fit "
+            f"{spar_diam_cm * _MM_PER_CM:.1f}mm dia with "
+            f"{clearance_mm:.1f}mm clearance"
+        )
 
-        def parse_pair(line):
-            v = try_floats(line)
-            if len(v) < 2:
-                raise ValueError(f"Bad coordinate line: {line!r}")
-            return (v[0], v[1])
+    spar_radius_cm = spar_diam_cm / 2.0
+    labels = ["fore", "aft"] if len(spars) == 2 else ["mid"]
+    placed = []
+    for (cx, cy, thickness), label in zip(spars, labels):
+        center = adsk.core.Point3D.create(
+            cx * chord_cm, cy * chord_cm, 0.0
+        )
+        sketch.sketchCurves.sketchCircles.addByCenterRadius(
+            center, spar_radius_cm
+        )
+        clearance_actual_mm = (thickness * chord_cm - spar_diam_cm) / 2.0 * _MM_PER_CM
+        placed.append(
+            f"{label} {cx * 100:.1f}% ({clearance_actual_mm:.1f}mm clr)"
+        )
 
-        upper = [parse_pair(coord_lines[i]) for i in range(n_upper)]
-        lower = [parse_pair(coord_lines[n_upper + i]) for i in range(n_lower)]
-
-        # Lednicer: upper goes LE(0) -> TE(1), lower goes LE(0) -> TE(1)
-        # Convert to a single closed loop: TE -> upper -> LE -> lower -> TE
-        coords = list(reversed(upper)) + lower[1:]  # skip duplicate LE point
-
-    else:
-        coords = []
-        for line in data_lines:
-            vals = try_floats(line)
-            if len(vals) >= 2:
-                coords.append((vals[0], vals[1]))
-
-    if not coords:
-        raise ValueError(f"Could not parse any coordinates from {filepath!r}")
-
-    return name, coords
+    info = (
+        f"\n    Spars    : {spar_diam_cm * _MM_PER_CM:.1f}mm dia, "
+        f"{clearance_mm:.1f}mm min clearance"
+        f"\n    Placed   : " + ", ".join(placed)
+    )
+    if len(spars) == 2:
+        sep_mm = (spars[1][0] - spars[0][0]) * chord_mm
+        info += f" ({sep_mm:.1f}mm separation)"
+    return info
 
 
-def load_data_folder(script_dir):
-    """
-    Scan <script_dir>/data/ for *.dat files.
+def _draw_control_surface(root, sketch, coords, chord_cm, split_pct,
+                           enable_offset, offset_mm, selected_name):
+    """Draw control surface sketch + split line. Returns an info string."""
+    split_frac = split_pct / 100.0
+    cs_coords = Utils.extract_control_surface(coords, split_frac)
 
-    Returns
-    -------
-    airfoils : dict  { display_name: (filepath, coords) }
-    errors   : list  of (filename, error_message) tuples
-    """
-    data_dir = os.path.join(script_dir, "data")
-    airfoils = {}
-    errors   = []
+    if not cs_coords:
+        return (
+            f"\n    Split    : could not find surfaces at "
+            f"{split_pct:.1f}% chord"
+        )
 
-    if not os.path.isdir(data_dir):
-        return airfoils, errors
+    cs_sketch = root.sketches.add(root.xYConstructionPlane)
+    cs_sketch.name = (
+        f"{selected_name} ctrl {split_pct:.0f}% "
+        f"c={chord_cm * _MM_PER_CM:.1f}mm"
+    )
 
-    for filename in sorted(os.listdir(data_dir)):
-        if not filename.lower().endswith(".dat"):
-            continue
-        filepath = os.path.join(data_dir, filename)
-        try:
-            name, coords = parse_dat_file(filepath)
-            display = name
-            suffix  = 2
-            while display in airfoils:
-                display = f"{name} ({suffix})"
-                suffix += 1
-            airfoils[display] = (filepath, coords)
-        except Exception as exc:
-            errors.append((filename, str(exc)))
+    # Closed polyline for CS (closing segment = split line)
+    _draw_polyline(cs_sketch, cs_coords, chord_cm)
 
-    return airfoils, errors
+    # Split line on the main airfoil sketch
+    sketch.sketchCurves.sketchLines.addByTwoPoints(
+        adsk.core.Point3D.create(
+            cs_coords[0][0] * chord_cm,
+            cs_coords[0][1] * chord_cm, 0.0,
+        ),
+        adsk.core.Point3D.create(
+            cs_coords[-1][0] * chord_cm,
+            cs_coords[-1][1] * chord_cm, 0.0,
+        ),
+    )
+
+    # Control-surface offset
+    if enable_offset and offset_mm > 0:
+        _draw_offset(cs_sketch, cs_coords, chord_cm, offset_mm)
+
+    return (
+        f"\n    Split    : {split_pct:.1f}% chord "
+        f"(x = {split_frac * chord_cm * _MM_PER_CM:.2f} mm)"
+        f'\n    CS sketch: "{cs_sketch.name}"'
+    )
 
 
 # -- Fusion 360 Dialog ---------------------------------------------------------
@@ -141,6 +167,7 @@ class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             cmd    = args.command
             inputs = cmd.commandInputs
 
+            # --- Airfoil selector ---
             local_dd = inputs.addDropDownCommandInput(
                 "local_airfoil", "Profile",
                 adsk.core.DropDownStyles.TextListDropDownStyle,
@@ -152,9 +179,47 @@ class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 local_dd.listItems.add(_EMPTY_LOCAL, True)
                 local_dd.isEnabled = False
 
+            # --- Chord length ---
             inputs.addValueInput(
                 "chord", "Chord Length", "mm",
                 adsk.core.ValueInput.createByReal(10.0),  # 10 cm = 100 mm
+            )
+
+            # --- Control surface split ---
+            inputs.addBoolValueInput(
+                "enable_split", "Control Surface Split", True, "", True,
+            )
+            inputs.addValueInput(
+                "split_pct", "Split at Chord %", "",
+                adsk.core.ValueInput.createByReal(_DEFAULT_SPLIT_PCT),
+            )
+
+            # --- Inner offset ---
+            inputs.addBoolValueInput(
+                "enable_offset", "Inner Offset", True, "", True,
+            )
+            inputs.addValueInput(
+                "offset", "Offset Distance", "mm",
+                adsk.core.ValueInput.createByReal(
+                    _DEFAULT_OFFSET_MM / _MM_PER_CM
+                ),
+            )
+
+            # --- Spar holes ---
+            inputs.addBoolValueInput(
+                "enable_spars", "Spar Holes", True, "", True,
+            )
+            inputs.addValueInput(
+                "spar_diameter", "Spar Diameter", "mm",
+                adsk.core.ValueInput.createByReal(
+                    _DEFAULT_SPAR_DIAMETER_MM / _MM_PER_CM
+                ),
+            )
+            inputs.addValueInput(
+                "spar_clearance", "Spar Clearance", "mm",
+                adsk.core.ValueInput.createByReal(
+                    _DEFAULT_SPAR_CLEARANCE_MM / _MM_PER_CM
+                ),
             )
 
             on_execute = AirfoilCommandExecuteHandler(self._airfoils)
@@ -178,6 +243,7 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
         try:
             inputs = args.command.commandInputs
 
+            # ---- read inputs ----
             local_dd = inputs.itemById("local_airfoil")
             selected = local_dd.selectedItem
 
@@ -189,7 +255,16 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 return
 
             selected_name = selected.name
-            chord_cm      = inputs.itemById("chord").value   # Fusion returns cm
+            chord_cm      = inputs.itemById("chord").value
+            enable_split  = inputs.itemById("enable_split").value
+            split_pct     = inputs.itemById("split_pct").value
+            enable_offset = inputs.itemById("enable_offset").value
+            offset_cm     = inputs.itemById("offset").value
+            offset_mm     = offset_cm * _MM_PER_CM
+            enable_spars  = inputs.itemById("enable_spars").value
+            spar_diam_cm  = inputs.itemById("spar_diameter").value
+            spar_clr_cm   = inputs.itemById("spar_clearance").value
+            spar_clr_mm   = spar_clr_cm * _MM_PER_CM
 
             if selected_name not in self._airfoils:
                 _app.userInterface.messageBox(
@@ -198,29 +273,46 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 )
                 return
 
-            _, coords = self._airfoils[selected_name]
+            _, raw_coords = self._airfoils[selected_name]
+            raw_count = len(raw_coords)
+            coords = Utils.double_points(raw_coords)
 
-            des      = adsk.fusion.Design.cast(_app.activeProduct)
-            root     = des.rootComponent
-            sketch   = root.sketches.add(root.xYConstructionPlane)
-            sketch.name = f"{selected_name} c={chord_cm * 10:.1f}mm"
+            # ---- create sketch ----
+            des    = adsk.fusion.Design.cast(_app.activeProduct)
+            root   = des.rootComponent
+            sketch = root.sketches.add(root.xYConstructionPlane)
+            sketch.name = f"{selected_name} c={chord_cm * _MM_PER_CM:.1f}mm"
 
-            pts = adsk.core.ObjectCollection.create()
-            for xn, yn in coords:
-                pts.add(adsk.core.Point3D.create(xn * chord_cm, yn * chord_cm, 0.0))
-            # Close the loop
-            pts.add(adsk.core.Point3D.create(
-                coords[0][0] * chord_cm, coords[0][1] * chord_cm, 0.0
-            ))
+            _draw_polyline(sketch, coords, chord_cm)
 
-            spline = sketch.sketchCurves.sketchFittedSplines.add(pts)
-            spline.isClosed = True
+            if enable_offset and offset_mm > 0:
+                _draw_offset(sketch, coords, chord_cm, offset_mm)
 
+            # ---- spar holes (fore section only) ----
+            spar_info = ""
+            if enable_spars:
+                max_x = split_pct / 100.0 if enable_split and 0 < split_pct < 100 else 1.0
+                spar_info = _draw_spar_holes(
+                    sketch, coords, chord_cm, spar_diam_cm,
+                    spar_clr_mm, max_x,
+                )
+
+            # ---- control surface ----
+            split_info = ""
+            if enable_split and 0 < split_pct < 100:
+                split_info = _draw_control_surface(
+                    root, sketch, coords, chord_cm, split_pct,
+                    enable_offset, offset_mm, selected_name,
+                )
+
+            # ---- summary ----
             _app.userInterface.messageBox(
                 f'Sketch created: "{sketch.name}"\n'
                 f"    Airfoil : {selected_name}\n"
-                f"    Chord   : {chord_cm * 10:.2f} mm\n"
-                f"    Points  : {len(coords)}"
+                f"    Chord   : {chord_cm * _MM_PER_CM:.2f} mm\n"
+                f"    Points  : {raw_count} raw -> {len(coords)} doubled"
+                f"{spar_info}"
+                f"{split_info}"
             )
 
         except Exception:
@@ -232,7 +324,7 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
 # -- Entry Point ---------------------------------------------------------------
 
 def run(context):
-    global _app, _handlers
+    global _app, _handlers, Utils
     _handlers = []
 
     try:
@@ -245,10 +337,18 @@ def run(context):
             return
 
         script_dir = os.path.dirname(os.path.realpath(__file__))
-        data_dir   = os.path.join(script_dir, "data")
-        os.makedirs(data_dir, exist_ok=True)   # create data/ if it doesn't exist
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
 
-        airfoils, errors = load_data_folder(script_dir)
+        # Reload Utils on every run so code changes take effect without
+        # restarting Fusion 360.
+        import Utils
+        importlib.reload(Utils)
+
+        data_dir = os.path.join(script_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        airfoils, errors = Utils.load_data_folder(script_dir)
 
         if errors:
             ui.messageBox(
