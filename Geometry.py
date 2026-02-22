@@ -159,3 +159,88 @@ def build_elevator_contour(coords, split_frac, inset_norm):
     """
     wall_frac = split_frac + inset_norm
     return extract_control_surface(coords, wall_frac)
+
+
+def _fillet_corner(p_prev, p_corner, p_next, radius, n_arc=8):
+    """
+    Replace a sharp corner with a circular fillet arc.
+
+    Returns arc points from the tangent on the (p_prev -> p_corner) edge
+    to the tangent on the (p_corner -> p_next) edge.  Falls back to
+    [p_corner] when the fillet cannot be computed.
+    """
+    dx1 = p_prev[0] - p_corner[0]
+    dy1 = p_prev[1] - p_corner[1]
+    dx2 = p_next[0] - p_corner[0]
+    dy2 = p_next[1] - p_corner[1]
+
+    len1 = math.hypot(dx1, dy1)
+    len2 = math.hypot(dx2, dy2)
+    if len1 < _EPSILON or len2 < _EPSILON:
+        return [p_corner]
+
+    dx1, dy1 = dx1 / len1, dy1 / len1
+    dx2, dy2 = dx2 / len2, dy2 / len2
+
+    dot = max(-1.0, min(1.0, dx1 * dx2 + dy1 * dy2))
+    half = math.acos(dot) / 2.0
+    if half < 1e-6:
+        return [p_corner]
+
+    sin_half = math.sin(half)
+    tan_half = math.tan(half)
+    if sin_half < _EPSILON or abs(tan_half) < _EPSILON:
+        return [p_corner]
+
+    tan_dist = radius / tan_half
+
+    # Shrink radius if tangent distance exceeds available edge length
+    if tan_dist > len1 * 0.9 or tan_dist > len2 * 0.9:
+        tan_dist = min(len1, len2) * 0.9
+        radius = tan_dist * tan_half
+
+    t1 = (p_corner[0] + dx1 * tan_dist, p_corner[1] + dy1 * tan_dist)
+    t2 = (p_corner[0] + dx2 * tan_dist, p_corner[1] + dy2 * tan_dist)
+
+    bx = dx1 + dx2
+    by = dy1 + dy2
+    blen = math.hypot(bx, by)
+    if blen < _EPSILON:
+        return [p_corner]
+    bx, by = bx / blen, by / blen
+
+    cx = p_corner[0] + bx * (radius / sin_half)
+    cy = p_corner[1] + by * (radius / sin_half)
+
+    a1 = math.atan2(t1[1] - cy, t1[0] - cx)
+    a2 = math.atan2(t2[1] - cy, t2[0] - cx)
+    da = a2 - a1
+    if da > math.pi:
+        da -= 2.0 * math.pi
+    elif da < -math.pi:
+        da += 2.0 * math.pi
+
+    return [
+        (cx + radius * math.cos(a1 + da * i / n_arc),
+         cy + radius * math.sin(a1 + da * i / n_arc))
+        for i in range(n_arc + 1)
+    ]
+
+
+def round_cs_wall_corners(contour, radius_norm, n_arc=8):
+    """
+    Round the two wall-side corners of a control-surface contour.
+
+    The closing segment (last point -> first point) is the wall.
+    Filleting these corners allows better range of motion when the
+    control surface rotates on its hinge.
+    """
+    if len(contour) < 4 or radius_norm <= 0:
+        return list(contour)
+
+    fillet_top = _fillet_corner(
+        contour[-1], contour[0], contour[1], radius_norm, n_arc)
+    fillet_bot = _fillet_corner(
+        contour[-2], contour[-1], contour[0], radius_norm, n_arc)
+
+    return fillet_top + list(contour[1:-1]) + fillet_bot

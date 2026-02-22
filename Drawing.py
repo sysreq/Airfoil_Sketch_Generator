@@ -185,6 +185,10 @@ def draw_control_surface(root, sketch, coords, chord_cm, split_pct,
         if elev_coords is None:
             elev_coords = cs_coords  # fallback
 
+        # Round wall-side corners for hinge rotation clearance
+        elev_coords = Geometry.round_cs_wall_corners(
+            elev_coords, inset_norm)
+
         # Draw elevator contour on CS sketch
         draw_polyline(cs_sketch, elev_coords, chord_cm)
 
@@ -194,7 +198,8 @@ def draw_control_surface(root, sketch, coords, chord_cm, split_pct,
         y_lower = cs_coords[-1][1]
         hinge_y = (y_upper + y_lower) / 2.0
         slot_half = (hinge_slot_height_mm / chord_mm) / 2.0
-        slot_depth = hinge_slot_depth_mm / chord_mm
+        # Each side gets half the remaining depth after subtracting the inset
+        slot_depth = max(0.0, hinge_slot_depth_mm - cs_inset_mm) / 2.0 / chord_mm
 
         # CS slot at wall_frac, opens toward TE
         _draw_hinge_slot(cs_sketch, elev_coords[0][0], hinge_y,
@@ -230,9 +235,11 @@ def draw_control_surface(root, sketch, coords, chord_cm, split_pct,
         f'\n    CS sketch: "{cs_sketch.name}"'
     )
     if enable_hinge:
+        per_side_mm = max(0.0, hinge_slot_depth_mm - cs_inset_mm) / 2.0
         info += (
             f"\n    Hinge    : {hinge_slot_height_mm:.1f} x "
-            f"{hinge_slot_depth_mm:.1f}mm slot, "
-            f"{cs_inset_mm:.1f}mm inset"
+            f"{per_side_mm:.1f}mm slot (x2), "
+            f"{cs_inset_mm:.1f}mm inset, "
+            f"{hinge_slot_depth_mm:.1f}mm total"
         )
     return info

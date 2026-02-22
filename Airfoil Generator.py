@@ -33,16 +33,9 @@ Airfoils  = None
 Geometry  = None
 Offset    = None
 Infill    = None
+Preview   = None
 Drawing   = None
-
-# Defaults
-_DEFAULT_SPLIT_PCT           = 75.0
-_DEFAULT_OFFSET_MM           = 2.0
-_DEFAULT_SPAR_DIAMETER_MM    = 15.5
-_DEFAULT_SPAR_CLEARANCE_MM   = 3.0
-_DEFAULT_HINGE_SLOT_HEIGHT_MM = 1.2
-_DEFAULT_HINGE_SLOT_DEPTH_MM  = 10.0
-_DEFAULT_CS_INSET_MM          = 2.5
+GUI       = None
 
 
 # -- Fusion 360 Dialog ---------------------------------------------------------
@@ -58,109 +51,16 @@ class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
         try:
             cmd    = args.command
             inputs = cmd.commandInputs
-            cfg    = self._config
 
-            # --- Airfoil selector ---
-            local_dd = inputs.addDropDownCommandInput(
-                "local_airfoil", "Profile",
-                adsk.core.DropDownStyles.TextListDropDownStyle,
-            )
-            saved_airfoil = cfg.get("airfoil", "")
-            if self._airfoils:
-                for name in self._airfoils:
-                    local_dd.listItems.add(
-                        name, name == saved_airfoil if saved_airfoil else False,
-                    )
-                if local_dd.selectedItem is None and local_dd.listItems.count > 0:
-                    local_dd.listItems.item(0).isSelected = True
-            else:
-                local_dd.listItems.add(_EMPTY_LOCAL, True)
-                local_dd.isEnabled = False
+            # Delegate dialog building to GUI module
+            GUI.build_inputs(cmd, inputs, self._airfoils, self._config)
 
-            # --- Chord length ---
-            inputs.addValueInput(
-                "chord", "Chord Length", "mm",
-                adsk.core.ValueInput.createByReal(cfg.get("chord_cm", 10.0)),
-            )
+            # Register input-changed handler for live preview
+            on_changed = GUI.AirfoilInputChangedHandler(self._airfoils)
+            cmd.inputChanged.add(on_changed)
+            _handlers.append(on_changed)
 
-            # --- Control surface split ---
-            inputs.addBoolValueInput(
-                "enable_split", "Control Surface Split", True, "",
-                cfg.get("enable_split", True),
-            )
-            inputs.addValueInput(
-                "split_pct", "Split at Chord %", "",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("split_pct", _DEFAULT_SPLIT_PCT)
-                ),
-            )
-
-            # --- Hinge geometry ---
-            inputs.addBoolValueInput(
-                "enable_hinge", "Elevator/Flap Hinge", True, "",
-                cfg.get("enable_hinge", True),
-            )
-            inputs.addValueInput(
-                "hinge_slot_height", "Hinge Slot Height", "mm",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("hinge_slot_height_mm",
-                            _DEFAULT_HINGE_SLOT_HEIGHT_MM)
-                    / Drawing.MM_PER_CM
-                ),
-            )
-            inputs.addValueInput(
-                "hinge_slot_depth", "Hinge Slot Depth", "mm",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("hinge_slot_depth_mm",
-                            _DEFAULT_HINGE_SLOT_DEPTH_MM)
-                    / Drawing.MM_PER_CM
-                ),
-            )
-            inputs.addValueInput(
-                "cs_inset", "CS Leading Edge Inset", "mm",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("cs_inset_mm", _DEFAULT_CS_INSET_MM)
-                    / Drawing.MM_PER_CM
-                ),
-            )
-
-            # --- Inner offset ---
-            inputs.addBoolValueInput(
-                "enable_offset", "Inner Offset", True, "",
-                cfg.get("enable_offset", True),
-            )
-            inputs.addValueInput(
-                "offset", "Offset Distance", "mm",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("offset_mm", _DEFAULT_OFFSET_MM)
-                    / Drawing.MM_PER_CM
-                ),
-            )
-
-            # --- Spar holes ---
-            inputs.addBoolValueInput(
-                "enable_spars", "Spar Holes", True, "",
-                cfg.get("enable_spars", True),
-            )
-            inputs.addValueInput(
-                "spar_diameter", "Spar Diameter", "mm",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("spar_diameter_mm", _DEFAULT_SPAR_DIAMETER_MM)
-                    / Drawing.MM_PER_CM
-                ),
-            )
-            inputs.addValueInput(
-                "spar_clearance", "Spar Clearance", "mm",
-                adsk.core.ValueInput.createByReal(
-                    cfg.get("spar_clearance_mm", _DEFAULT_SPAR_CLEARANCE_MM)
-                    / Drawing.MM_PER_CM
-                ),
-            )
-            inputs.addBoolValueInput(
-                "enable_lightening", "Lightening Holes", True, "",
-                cfg.get("enable_lightening", True),
-            )
-
+            # Register execute handler
             on_execute = AirfoilCommandExecuteHandler(
                 self._script_dir, self._airfoils,
             )
@@ -185,36 +85,32 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
         try:
             inputs = args.command.commandInputs
 
-            # ---- read inputs ----
-            local_dd = inputs.itemById("local_airfoil")
-            selected = local_dd.selectedItem
+            # ---- read inputs via GUI module ----
+            cfg = GUI.read_inputs(inputs)
 
-            if not selected or selected.name == _EMPTY_LOCAL:
+            selected_name = cfg["airfoil"]
+            if not selected_name or selected_name == _EMPTY_LOCAL:
                 _app.userInterface.messageBox(
                     "No local airfoil selected.\n"
                     "Add .dat files to the data/ folder and re-run the script."
                 )
                 return
 
-            selected_name = selected.name
-            chord_cm      = inputs.itemById("chord").value
-            enable_split  = inputs.itemById("enable_split").value
-            split_pct     = inputs.itemById("split_pct").value
-            enable_offset = inputs.itemById("enable_offset").value
-            offset_cm     = inputs.itemById("offset").value
-            offset_mm     = offset_cm * Drawing.MM_PER_CM
-            enable_hinge  = inputs.itemById("enable_hinge").value
-            hinge_h_cm    = inputs.itemById("hinge_slot_height").value
-            hinge_h_mm    = hinge_h_cm * Drawing.MM_PER_CM
-            hinge_d_cm    = inputs.itemById("hinge_slot_depth").value
-            hinge_d_mm    = hinge_d_cm * Drawing.MM_PER_CM
-            cs_inset_cm   = inputs.itemById("cs_inset").value
-            cs_inset_mm   = cs_inset_cm * Drawing.MM_PER_CM
-            enable_spars  = inputs.itemById("enable_spars").value
-            spar_diam_cm  = inputs.itemById("spar_diameter").value
-            spar_clr_cm   = inputs.itemById("spar_clearance").value
-            spar_clr_mm   = spar_clr_cm * Drawing.MM_PER_CM
-            enable_light  = inputs.itemById("enable_lightening").value
+            chord_cm      = cfg["chord_cm"]
+            enable_split  = cfg["enable_split"]
+            split_pct     = cfg["split_pct"]
+            enable_offset = cfg["enable_offset"]
+            offset_mm     = cfg["offset_mm"]
+            enable_hinge  = cfg["enable_hinge"]
+            hinge_h_mm    = cfg["hinge_slot_height_mm"]
+            hinge_d_mm    = cfg["hinge_slot_depth_mm"]
+            cs_inset_mm   = cfg["cs_inset_mm"]
+            enable_spars  = cfg["enable_spars"]
+            spar_diam_mm  = cfg["spar_diameter_mm"]
+            spar_clr_mm   = cfg["spar_clearance_mm"]
+            enable_light  = cfg["enable_lightening"]
+
+            spar_diam_cm  = spar_diam_mm / Drawing.MM_PER_CM
 
             if selected_name not in self._airfoils:
                 _app.userInterface.messageBox(
@@ -246,6 +142,11 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 max_x = (split_pct / 100.0
                          if enable_split and 0 < split_pct < 100
                          else 1.0)
+                # Enforce minimum 2mm gap between aft spar edge and hinge
+                if enable_split and enable_hinge and 0 < split_pct < 100:
+                    min_hinge_gap_mm = 2.0
+                    shortfall = max(0.0, min_hinge_gap_mm - spar_clr_mm)
+                    max_x -= shortfall / chord_mm
                 spars = Infill.find_optimal_spar_positions(
                     coords,
                     spar_diam_cm / chord_cm,
@@ -311,7 +212,7 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 "enable_offset": enable_offset,
                 "offset_mm": offset_mm,
                 "enable_spars": enable_spars,
-                "spar_diameter_mm": spar_diam_cm * Drawing.MM_PER_CM,
+                "spar_diameter_mm": spar_diam_mm,
                 "spar_clearance_mm": spar_clr_mm,
                 "enable_lightening": enable_light,
             })
@@ -325,7 +226,8 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
 # -- Entry Point ---------------------------------------------------------------
 
 def run(context):
-    global _app, _handlers, Airfoils, Geometry, Offset, Infill, Drawing
+    global _app, _handlers
+    global Airfoils, Geometry, Offset, Infill, Preview, Drawing, GUI
     _handlers = []
 
     try:
@@ -344,17 +246,29 @@ def run(context):
         # Reload modules on every run so code changes take effect without
         # restarting Fusion 360.  Order matters: Geometry before Infill
         # (Infill imports Geometry), Offset before Drawing (Drawing imports
-        # Offset), and all geometry modules before Drawing.
+        # Offset), Preview before GUI, and all geometry modules before Drawing.
         import Airfoils
         import Geometry
         import Offset
         import Infill
+        import Preview
         import Drawing
+        import GUI
         importlib.reload(Airfoils)
         importlib.reload(Geometry)
         importlib.reload(Offset)
         importlib.reload(Infill)
+        importlib.reload(Preview)
         importlib.reload(Drawing)
+        importlib.reload(GUI)
+
+        GUI.init(_app, {
+            "Geometry": Geometry,
+            "Offset": Offset,
+            "Infill": Infill,
+            "Preview": Preview,
+            "Drawing": Drawing,
+        })
 
         data_dir = os.path.join(script_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
