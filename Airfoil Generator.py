@@ -59,24 +59,18 @@ def _draw_polyline(sketch, contour, chord_cm, closed=True):
     sketch.isComputeDeferred = False
 
 
-def _draw_offset(sketch, contour, chord_cm, offset_mm):
-    """Draw an inward-offset closed polyline from *contour*."""
+def _draw_offset(sketch, contour, chord_cm, offset_mm, spar_truncation=None):
+    """Draw an inward-offset closed polyline, optionally truncated at fore spar."""
     offset_norm = offset_mm / (chord_cm * _MM_PER_CM)
     off_pts = Utils.offset_contour(contour, offset_norm)
+    if spar_truncation is not None:
+        cx, cy, r = spar_truncation
+        off_pts = Utils.truncate_offset_at_spar(off_pts, cx, cy, r)
     _draw_polyline(sketch, off_pts, chord_cm)
 
 
-def _draw_spar_holes(sketch, coords, chord_cm, spar_diam_cm, clearance_mm,
-                      max_x_frac):
-    """Auto-place spar holes for maximum separation. Returns info string."""
-    chord_mm = chord_cm * _MM_PER_CM
-    spar_diam_norm = spar_diam_cm / chord_cm
-    clearance_norm = clearance_mm / chord_mm
-
-    spars = Utils.find_optimal_spar_positions(
-        coords, spar_diam_norm, clearance_norm, max_x_frac,
-    )
-
+def _draw_spar_circles(sketch, spars, chord_cm, spar_diam_cm, clearance_mm):
+    """Draw spar circles at pre-computed positions. Returns info string."""
     if not spars:
         return (
             f"\n    Spars    : could not fit "
@@ -84,6 +78,7 @@ def _draw_spar_holes(sketch, coords, chord_cm, spar_diam_cm, clearance_mm,
             f"{clearance_mm:.1f}mm clearance"
         )
 
+    chord_mm = chord_cm * _MM_PER_CM
     spar_radius_cm = spar_diam_cm / 2.0
     labels = ["fore", "aft"] if len(spars) == 2 else ["mid"]
     placed = []
@@ -94,10 +89,8 @@ def _draw_spar_holes(sketch, coords, chord_cm, spar_diam_cm, clearance_mm,
         sketch.sketchCurves.sketchCircles.addByCenterRadius(
             center, spar_radius_cm
         )
-        clearance_actual_mm = (thickness * chord_cm - spar_diam_cm) / 2.0 * _MM_PER_CM
-        placed.append(
-            f"{label} {cx * 100:.1f}% ({clearance_actual_mm:.1f}mm clr)"
-        )
+        clr_mm = (thickness * chord_cm - spar_diam_cm) / 2.0 * _MM_PER_CM
+        placed.append(f"{label} {cx * 100:.1f}% ({clr_mm:.1f}mm clr)")
 
     info = (
         f"\n    Spars    : {spar_diam_cm * _MM_PER_CM:.1f}mm dia, "
@@ -108,6 +101,49 @@ def _draw_spar_holes(sketch, coords, chord_cm, spar_diam_cm, clearance_mm,
         sep_mm = (spars[1][0] - spars[0][0]) * chord_mm
         info += f" ({sep_mm:.1f}mm separation)"
     return info
+
+
+def _draw_lightening_holes(sketch, coords, chord_cm, spars,
+                            spar_diam_cm, offset_mm, clearance_mm):
+    """Draw lightening holes between the two spars. Returns info string."""
+    chord_mm = chord_cm * _MM_PER_CM
+    holes = Utils.find_lightening_holes(
+        coords,
+        fore_spar_x=spars[0][0],
+        aft_spar_x=spars[1][0],
+        spar_diameter_norm=spar_diam_cm / chord_cm,
+        offset_norm=offset_mm / chord_mm,
+        clearance_norm=clearance_mm / chord_mm,
+    )
+
+    if not holes:
+        return "\n    Lighten  : no room for holes between spars"
+
+    # Shrink each hole by 1 mm to keep clear of the sloped offset walls
+    shrink_norm = 1.0 / chord_mm
+    holes = [(cx, cy, max(0.0, d - shrink_norm)) for cx, cy, d in holes]
+    holes = [(cx, cy, d) for cx, cy, d in holes if d > 0]
+
+    if not holes:
+        return "\n    Lighten  : no room for holes between spars"
+
+    for cx, cy, diam in holes:
+        center = adsk.core.Point3D.create(
+            cx * chord_cm, cy * chord_cm, 0.0
+        )
+        radius_cm = diam * chord_cm / 2.0
+        sketch.sketchCurves.sketchCircles.addByCenterRadius(center, radius_cm)
+
+    diams_mm = [h[2] * chord_mm for h in holes]
+    d_min, d_max = min(diams_mm), max(diams_mm)
+    if abs(d_max - d_min) < 0.1:
+        size_str = f"{d_min:.1f}mm dia"
+    else:
+        size_str = f"{d_min:.1f}-{d_max:.1f}mm dia"
+    return (
+        f"\n    Lighten  : {len(holes)} holes ({size_str}) "
+        f"between spars"
+    )
 
 
 def _draw_control_surface(root, sketch, coords, chord_cm, split_pct,
@@ -221,6 +257,9 @@ class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     _DEFAULT_SPAR_CLEARANCE_MM / _MM_PER_CM
                 ),
             )
+            inputs.addBoolValueInput(
+                "enable_lightening", "Lightening Holes", True, "", True,
+            )
 
             on_execute = AirfoilCommandExecuteHandler(self._airfoils)
             cmd.execute.add(on_execute)
@@ -265,6 +304,7 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
             spar_diam_cm  = inputs.itemById("spar_diameter").value
             spar_clr_cm   = inputs.itemById("spar_clearance").value
             spar_clr_mm   = spar_clr_cm * _MM_PER_CM
+            enable_light  = inputs.itemById("enable_lightening").value
 
             if selected_name not in self._airfoils:
                 _app.userInterface.messageBox(
@@ -285,17 +325,42 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
 
             _draw_polyline(sketch, coords, chord_cm)
 
-            if enable_offset and offset_mm > 0:
-                _draw_offset(sketch, coords, chord_cm, offset_mm)
-
-            # ---- spar holes (fore section only) ----
+            # ---- spar positions (computed before offset for truncation) ----
             spar_info = ""
+            lightening_info = ""
+            spars = []
             if enable_spars:
+                chord_mm = chord_cm * _MM_PER_CM
                 max_x = split_pct / 100.0 if enable_split and 0 < split_pct < 100 else 1.0
-                spar_info = _draw_spar_holes(
-                    sketch, coords, chord_cm, spar_diam_cm,
-                    spar_clr_mm, max_x,
+                spars = Utils.find_optimal_spar_positions(
+                    coords,
+                    spar_diam_cm / chord_cm,
+                    spar_clr_mm / chord_mm,
+                    max_x,
                 )
+
+            # ---- inner offset (truncated at fore spar when available) ----
+            spar_trunc = None
+            if enable_spars and spars:
+                cx, cy, _ = spars[0]  # fore spar
+                spar_trunc = (cx, cy, spar_diam_cm / chord_cm / 2.0)
+
+            if enable_offset and offset_mm > 0:
+                _draw_offset(sketch, coords, chord_cm, offset_mm, spar_trunc)
+
+            # ---- spar circles ----
+            if enable_spars:
+                spar_info = _draw_spar_circles(
+                    sketch, spars, chord_cm, spar_diam_cm, spar_clr_mm,
+                )
+
+                # ---- lightening holes ----
+                if enable_light and len(spars) == 2 \
+                   and enable_offset and offset_mm > 0:
+                    lightening_info = _draw_lightening_holes(
+                        sketch, coords, chord_cm, spars,
+                        spar_diam_cm, offset_mm, spar_clr_mm,
+                    )
 
             # ---- control surface ----
             split_info = ""
@@ -312,6 +377,7 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 f"    Chord   : {chord_cm * _MM_PER_CM:.2f} mm\n"
                 f"    Points  : {raw_count} raw -> {len(coords)} doubled"
                 f"{spar_info}"
+                f"{lightening_info}"
                 f"{split_info}"
             )
 

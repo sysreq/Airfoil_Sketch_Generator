@@ -183,6 +183,30 @@ def _pts_equal(a, b):
     return abs(a[0] - b[0]) < _EPSILON and abs(a[1] - b[1]) < _EPSILON
 
 
+def _tangent_to_circle(px, py, cx, cy, r):
+    """Return two tangent points on circle (cx,cy,r) from external point (px,py)."""
+    dx, dy = px - cx, py - cy
+    d = math.hypot(dx, dy)
+    if d <= r:
+        return None  # point inside circle
+    phi = math.atan2(dy, dx)
+    alpha = math.acos(r / d)
+    return (
+        (cx + r * math.cos(phi + alpha), cy + r * math.sin(phi + alpha)),
+        (cx + r * math.cos(phi - alpha), cy + r * math.sin(phi - alpha)),
+    )
+
+
+def _arc_points(cx, cy, r, angle_start, angle_end, n=12):
+    """Generate n points along a circular arc from angle_start to angle_end (radians)."""
+    pts = []
+    for i in range(n):
+        t = i / max(n - 1, 1)
+        a = angle_start + t * (angle_end - angle_start)
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
 def _find_upper_lower_at(coords, x_frac):
     """
     Find upper and lower surface points at normalised X position.
@@ -244,7 +268,8 @@ def find_optimal_spar_positions(coords, spar_diameter_norm, clearance_norm,
     list of (x, y_center, thickness) with 0, 1, or 2 entries.
     """
     min_thickness = spar_diameter_norm + 2.0 * clearance_norm
-    cap = min(max_x_frac, 0.999)
+    spar_radius = spar_diameter_norm / 2.0
+    cap = min(max_x_frac - spar_radius - clearance_norm, 0.999)
 
     # Scan at 0.1% chord resolution
     valid = []
@@ -270,6 +295,100 @@ def find_optimal_spar_positions(coords, spar_diameter_norm, clearance_norm,
         return [valid[len(valid) // 2]]
 
     return [fore, aft]
+
+
+def find_lightening_holes(coords, fore_spar_x, aft_spar_x,
+                           spar_diameter_norm, offset_norm, clearance_norm):
+    """
+    Place variable-diameter lightening holes between two spars.
+
+    Uses a two-pass approach:
+      1. Greedy walk to estimate how many holes fit.
+      2. Distribute that many centers evenly, then size each hole to
+         its local available space (larger in the thick middle, smaller
+         near the spars).  Capped so adjacent holes maintain at least
+         *clearance_norm* web between edges.
+
+    Parameters
+    ----------
+    coords : list of (x, y)
+        Normalised airfoil contour.
+    fore_spar_x, aft_spar_x : float
+        Normalised X positions of the two spar centers.
+    spar_diameter_norm : float
+        Spar diameter, normalised.
+    offset_norm : float
+        Skin offset distance, normalised.
+    clearance_norm : float
+        Minimum wall/web thickness, normalised.
+
+    Returns
+    -------
+    list of (x, y_center, diameter) in normalised space.
+    """
+    spar_radius = spar_diameter_norm / 2.0
+    x_start = fore_spar_x + spar_radius + clearance_norm
+    x_end = aft_spar_x - spar_radius - clearance_norm
+
+    if x_end <= x_start:
+        return []
+
+    def _max_diam_at(x_frac):
+        """Max hole diameter that fits inside the offset shell at *x_frac*."""
+        info = compute_spar_center(coords, min(x_frac, 0.999))
+        if info is None:
+            return 0.0
+        _, _, thickness = info
+        return max(0.0, thickness - 2.0 * offset_norm)
+
+    # Pass 1: greedy walk to estimate hole count
+    n_est = 0
+    x_left = x_start
+    while x_left < x_end:
+        diam = _max_diam_at(x_left)
+        if diam <= 0:
+            x_left += clearance_norm
+            continue
+        r = diam / 2.0
+        diam = min(diam, _max_diam_at(x_left + r))
+        if diam <= 0:
+            x_left += clearance_norm
+            continue
+        r = diam / 2.0
+        if x_left + 2.0 * r > x_end:
+            break
+        n_est += 1
+        x_left += diam + clearance_norm
+
+    # Pass 2: distribute centers evenly, size each at its position.
+    # Try n_est first; if any hole can't fit, reduce count and retry.
+    for n in range(n_est, 0, -1):
+        band = (x_end - x_start) / n
+        if band <= clearance_norm:
+            continue
+        holes = []
+        valid = True
+        for i in range(n):
+            cx = x_start + band * (i + 0.5)
+            if cx <= 0.0 or cx >= 1.0:
+                valid = False
+                break
+            diam = _max_diam_at(cx)
+            # Cap to band width minus clearance to prevent overlap
+            diam = min(diam, band - clearance_norm)
+            if diam <= 0:
+                valid = False
+                break
+            info = compute_spar_center(coords, cx)
+            if info is None:
+                valid = False
+                break
+            _, cy, _ = info
+            holes.append((cx, cy, diam))
+        if valid and holes:
+            return holes
+
+    return []
 
 
 def find_split_points(coords, split_frac):
@@ -389,6 +508,90 @@ def offset_contour(coords, offset_norm):
 
     # Collapse clusters of close points (e.g. where TE converges)
     result = _collapse_close_points(raw, offset_norm * _COLLAPSE_FRACTION)
+    return result
+
+
+def truncate_offset_at_spar(offset_pts, spar_cx, spar_cy, spar_radius):
+    """Truncate offset contour at the fore spar, replacing the LE section
+    with tangent lines and an arc along the spar circle.
+    Returns modified contour, or original if truncation not possible."""
+    if len(offset_pts) < 4:
+        return offset_pts
+
+    # Find LE index (minimum X point) in offset contour
+    le_idx = min(range(len(offset_pts)), key=lambda i: offset_pts[i][0])
+
+    # Scan backward from LE (upper side) to find where X crosses spar_cx
+    upper_cross_idx = None
+    upper_cross_pt = None
+    for i in range(le_idx, 0, -1):
+        xa, _ = offset_pts[i]
+        xb, _ = offset_pts[i - 1]
+        if xa <= spar_cx <= xb or xb <= spar_cx <= xa:
+            if abs(xb - xa) > _EPSILON:
+                t = (spar_cx - xa) / (xb - xa)
+                ya, yb = offset_pts[i][1], offset_pts[i - 1][1]
+                upper_cross_pt = (spar_cx, ya + t * (yb - ya))
+                upper_cross_idx = i
+                break
+    if upper_cross_pt is None:
+        return offset_pts
+
+    # Scan forward from LE (lower side) to find where X crosses spar_cx
+    lower_cross_idx = None
+    lower_cross_pt = None
+    for i in range(le_idx, len(offset_pts) - 1):
+        xa, _ = offset_pts[i]
+        xb, _ = offset_pts[i + 1]
+        if xa <= spar_cx <= xb or xb <= spar_cx <= xa:
+            if abs(xb - xa) > _EPSILON:
+                t = (spar_cx - xa) / (xb - xa)
+                ya, yb = offset_pts[i][1], offset_pts[i + 1][1]
+                lower_cross_pt = (spar_cx, ya + t * (yb - ya))
+                lower_cross_idx = i + 1
+                break
+    if lower_cross_pt is None:
+        return offset_pts
+
+    # Compute tangent from upper crossing to spar circle
+    tan_upper = _tangent_to_circle(
+        upper_cross_pt[0], upper_cross_pt[1], spar_cx, spar_cy, spar_radius
+    )
+    if tan_upper is None:
+        return offset_pts
+    # Pick the tangent point with higher Y (upper side)
+    upper_tan = tan_upper[0] if tan_upper[0][1] >= tan_upper[1][1] else tan_upper[1]
+
+    # Compute tangent from lower crossing to spar circle
+    tan_lower = _tangent_to_circle(
+        lower_cross_pt[0], lower_cross_pt[1], spar_cx, spar_cy, spar_radius
+    )
+    if tan_lower is None:
+        return offset_pts
+    # Pick the tangent point with lower Y (lower side)
+    lower_tan = tan_lower[0] if tan_lower[0][1] <= tan_lower[1][1] else tan_lower[1]
+
+    # Arc from upper tangent to lower tangent going around the LE side (through pi)
+    angle_upper = math.atan2(upper_tan[1] - spar_cy, upper_tan[0] - spar_cx)
+    angle_lower = math.atan2(lower_tan[1] - spar_cy, lower_tan[0] - spar_cx)
+
+    # Ensure we go the LE-side way (through pi / the left side of the circle)
+    # Upper tangent should have a positive angle, lower negative
+    # We want to sweep from upper angle down through pi to lower angle
+    if angle_upper < angle_lower:
+        angle_upper += 2.0 * math.pi
+
+    arc = _arc_points(spar_cx, spar_cy, spar_radius,
+                      angle_upper, angle_lower, n=16)
+
+    # Assemble: TE->upper side up to crossing, tangent line, arc, tangent line, lower side->TE
+    result = (
+        offset_pts[:upper_cross_idx]
+        + [upper_cross_pt, upper_tan]
+        + arc
+        + [lower_tan, lower_cross_pt]
+        + offset_pts[lower_cross_idx:]
+    )
     return result
 
 
