@@ -193,24 +193,31 @@ def _draw_control_surface(root, sketch, coords, chord_cm, split_pct,
 # -- Fusion 360 Dialog ---------------------------------------------------------
 
 class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
-    def __init__(self, script_dir, airfoils):
+    def __init__(self, script_dir, airfoils, config):
         super().__init__()
         self._script_dir = script_dir
         self._airfoils   = airfoils
+        self._config     = config
 
     def notify(self, args):
         try:
             cmd    = args.command
             inputs = cmd.commandInputs
+            cfg    = self._config
 
             # --- Airfoil selector ---
             local_dd = inputs.addDropDownCommandInput(
                 "local_airfoil", "Profile",
                 adsk.core.DropDownStyles.TextListDropDownStyle,
             )
+            saved_airfoil = cfg.get("airfoil", "")
             if self._airfoils:
-                for i, name in enumerate(self._airfoils):
-                    local_dd.listItems.add(name, i == 0)
+                for name in self._airfoils:
+                    local_dd.listItems.add(
+                        name, name == saved_airfoil if saved_airfoil else False,
+                    )
+                if local_dd.selectedItem is None and local_dd.listItems.count > 0:
+                    local_dd.listItems.item(0).isSelected = True
             else:
                 local_dd.listItems.add(_EMPTY_LOCAL, True)
                 local_dd.isEnabled = False
@@ -218,50 +225,60 @@ class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             # --- Chord length ---
             inputs.addValueInput(
                 "chord", "Chord Length", "mm",
-                adsk.core.ValueInput.createByReal(10.0),  # 10 cm = 100 mm
+                adsk.core.ValueInput.createByReal(cfg.get("chord_cm", 10.0)),
             )
 
             # --- Control surface split ---
             inputs.addBoolValueInput(
-                "enable_split", "Control Surface Split", True, "", True,
+                "enable_split", "Control Surface Split", True, "",
+                cfg.get("enable_split", True),
             )
             inputs.addValueInput(
                 "split_pct", "Split at Chord %", "",
-                adsk.core.ValueInput.createByReal(_DEFAULT_SPLIT_PCT),
+                adsk.core.ValueInput.createByReal(
+                    cfg.get("split_pct", _DEFAULT_SPLIT_PCT)
+                ),
             )
 
             # --- Inner offset ---
             inputs.addBoolValueInput(
-                "enable_offset", "Inner Offset", True, "", True,
+                "enable_offset", "Inner Offset", True, "",
+                cfg.get("enable_offset", True),
             )
             inputs.addValueInput(
                 "offset", "Offset Distance", "mm",
                 adsk.core.ValueInput.createByReal(
-                    _DEFAULT_OFFSET_MM / _MM_PER_CM
+                    cfg.get("offset_mm", _DEFAULT_OFFSET_MM) / _MM_PER_CM
                 ),
             )
 
             # --- Spar holes ---
             inputs.addBoolValueInput(
-                "enable_spars", "Spar Holes", True, "", True,
+                "enable_spars", "Spar Holes", True, "",
+                cfg.get("enable_spars", True),
             )
             inputs.addValueInput(
                 "spar_diameter", "Spar Diameter", "mm",
                 adsk.core.ValueInput.createByReal(
-                    _DEFAULT_SPAR_DIAMETER_MM / _MM_PER_CM
+                    cfg.get("spar_diameter_mm", _DEFAULT_SPAR_DIAMETER_MM)
+                    / _MM_PER_CM
                 ),
             )
             inputs.addValueInput(
                 "spar_clearance", "Spar Clearance", "mm",
                 adsk.core.ValueInput.createByReal(
-                    _DEFAULT_SPAR_CLEARANCE_MM / _MM_PER_CM
+                    cfg.get("spar_clearance_mm", _DEFAULT_SPAR_CLEARANCE_MM)
+                    / _MM_PER_CM
                 ),
             )
             inputs.addBoolValueInput(
-                "enable_lightening", "Lightening Holes", True, "", True,
+                "enable_lightening", "Lightening Holes", True, "",
+                cfg.get("enable_lightening", True),
             )
 
-            on_execute = AirfoilCommandExecuteHandler(self._airfoils)
+            on_execute = AirfoilCommandExecuteHandler(
+                self._script_dir, self._airfoils,
+            )
             cmd.execute.add(on_execute)
             _handlers.append(on_execute)
 
@@ -274,9 +291,10 @@ class AirfoilCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
 class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
     """Called when the user clicks OK -- creates the sketch."""
 
-    def __init__(self, airfoils):
+    def __init__(self, script_dir, airfoils):
         super().__init__()
-        self._airfoils = airfoils
+        self._script_dir = script_dir
+        self._airfoils   = airfoils
 
     def notify(self, args):
         try:
@@ -381,6 +399,20 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 f"{split_info}"
             )
 
+            # ---- persist settings for next run ----
+            Utils.save_config(self._script_dir, {
+                "airfoil": selected_name,
+                "chord_cm": chord_cm,
+                "enable_split": enable_split,
+                "split_pct": split_pct,
+                "enable_offset": enable_offset,
+                "offset_mm": offset_mm,
+                "enable_spars": enable_spars,
+                "spar_diameter_mm": spar_diam_cm * _MM_PER_CM,
+                "spar_clearance_mm": spar_clr_mm,
+                "enable_lightening": enable_light,
+            })
+
         except Exception:
             _app.userInterface.messageBox(
                 "Error generating sketch:\n" + traceback.format_exc()
@@ -415,6 +447,7 @@ def run(context):
         os.makedirs(data_dir, exist_ok=True)
 
         airfoils, errors = Utils.load_data_folder(script_dir)
+        config = Utils.load_config(script_dir)
 
         if errors:
             ui.messageBox(
@@ -431,7 +464,7 @@ def run(context):
             CMD_ID, "Airfoil Sketch Generator", ""
         )
 
-        on_created = AirfoilCommandCreatedHandler(script_dir, airfoils)
+        on_created = AirfoilCommandCreatedHandler(script_dir, airfoils, config)
         cmd_def.commandCreated.add(on_created)
         _handlers.append(on_created)
 

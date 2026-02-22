@@ -7,6 +7,7 @@ coordinate lists, and locating control-surface split points.
 No Fusion 360 dependencies — safe to unit-test standalone.
 """
 
+import json
 import os
 import math
 
@@ -118,6 +119,25 @@ def load_data_folder(script_dir):
             errors.append((filename, str(exc)))
 
     return airfoils, errors
+
+
+# -- Config Persistence --------------------------------------------------------
+
+def load_config(script_dir):
+    """Load config.json from script_dir. Returns dict or empty dict on failure."""
+    path = os.path.join(script_dir, "config.json")
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(script_dir, settings):
+    """Save settings dict to config.json in script_dir."""
+    path = os.path.join(script_dir, "config.json")
+    with open(path, "w") as f:
+        json.dump(settings, f, indent=2)
 
 
 # -- Geometry Helpers ----------------------------------------------------------
