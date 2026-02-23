@@ -8,6 +8,114 @@ Pure Python — only math + Geometry. No Fusion 360 dependencies.
 """
 
 import Geometry
+import Offset
+
+
+def compute_2d_geometry(coords, cfg):
+    """Compute all 2D geometry features from normalised coords + config.
+
+    Parameters
+    ----------
+    coords : list of (x, y)
+        Normalised [0..1] airfoil contour (already densified).
+    cfg : dict
+        Config dict with keys: chord_cm, enable_split, split_pct,
+        enable_offset, offset_mm, enable_spars, spar_diameter_mm,
+        spar_clearance_mm, enable_lightening, enable_hinge.
+
+    Returns
+    -------
+    dict with keys:
+        offset_pts       : list of (x, y) or None
+        spars            : list of (x, y_center, thickness)
+        spar_trunc       : (cx, cy, r) or None — fore spar truncation info
+        lightening_holes : list of (cx, cy, diam)
+        cs_coords        : list of (x, y) or None
+    """
+    chord_cm = cfg.get("chord_cm", 10.0)
+    chord_mm = chord_cm * Geometry.MM_PER_CM
+    enable_split = cfg.get("enable_split", False)
+    split_pct = cfg.get("split_pct", 75.0)
+    enable_offset = cfg.get("enable_offset", False)
+    offset_mm = cfg.get("offset_mm", 2.0)
+    enable_spars = cfg.get("enable_spars", False)
+    spar_diameter_mm = cfg.get("spar_diameter_mm", 15.5)
+    spar_clearance_mm = cfg.get("spar_clearance_mm", 3.0)
+    enable_lightening = cfg.get("enable_lightening", False)
+    enable_hinge = cfg.get("enable_hinge", False)
+
+    offset_pts = None
+    spars = []
+    spar_trunc = None
+    lightening_holes = []
+    cs_coords = None
+
+    # Offset contour
+    if enable_offset and offset_mm > 0 and chord_mm > 0:
+        offset_norm = offset_mm / chord_mm
+        offset_pts = Offset.offset_contour(coords, offset_norm)
+
+    # Spars
+    if enable_spars and chord_mm > 0:
+        spar_diam_cm = spar_diameter_mm / Geometry.MM_PER_CM
+        max_x = compute_spar_max_x(
+            split_pct, enable_split, enable_hinge,
+            spar_clearance_mm, chord_mm,
+        )
+        spars = find_optimal_spar_positions(
+            coords,
+            spar_diam_cm / chord_cm,
+            spar_clearance_mm / chord_mm,
+            max_x,
+        )
+
+        # Truncate offset at fore spar
+        if offset_pts and spars:
+            cx, cy, _ = spars[0]
+            spar_r = spar_diam_cm / chord_cm / 2.0
+            spar_trunc = (cx, cy, spar_r)
+            offset_pts = Offset.truncate_offset_at_spar(
+                offset_pts, cx, cy, spar_r)
+
+        # Lightening holes
+        if (enable_lightening and len(spars) == 2
+                and enable_offset and offset_mm > 0):
+            lightening_holes = find_lightening_holes(
+                coords,
+                fore_spar_x=spars[0][0],
+                aft_spar_x=spars[1][0],
+                spar_diameter_norm=spar_diam_cm / chord_cm,
+                offset_norm=offset_mm / chord_mm,
+                clearance_norm=spar_clearance_mm / chord_mm,
+            )
+
+    # Control surface contour
+    if enable_split and 0 < split_pct < 100:
+        cs_coords = Geometry.extract_control_surface(coords, split_pct / 100.0)
+
+    return {
+        "offset_pts": offset_pts,
+        "spars": spars,
+        "spar_trunc": spar_trunc,
+        "lightening_holes": lightening_holes,
+        "cs_coords": cs_coords,
+    }
+
+
+def compute_spar_max_x(split_pct, enable_split, enable_hinge,
+                       spar_clearance_mm, chord_mm):
+    """Compute rightmost X fraction for spar placement.
+
+    Accounts for CS split and minimum hinge gap when hinge is enabled.
+    """
+    max_x = 1.0
+    if enable_split and 0 < split_pct < 100:
+        max_x = split_pct / 100.0
+        if enable_hinge and chord_mm > 0:
+            min_hinge_gap_mm = 2.0
+            shortfall = max(0.0, min_hinge_gap_mm - spar_clearance_mm)
+            max_x -= shortfall / chord_mm
+    return max_x
 
 
 def find_optimal_spar_positions(coords, spar_diameter_norm, clearance_norm,
@@ -40,17 +148,18 @@ def find_optimal_spar_positions(coords, spar_diameter_norm, clearance_norm,
     spar_radius = spar_diameter_norm / 2.0
     cap = min(max_x_frac - spar_radius - clearance_norm, 0.999)
 
+    # Pre-compute surface split once for the entire scan
+    query = Geometry.create_surface_query(coords)
+
     # Scan at 0.1% chord resolution
     valid = []
     for i in range(1, 1000):
         x = cap * i / 1000.0
-        result = Geometry.find_upper_lower_at(coords, x)
-        if result is None:
+        info = query(x)
+        if info is None:
             continue
-        _, upper_pt, _, lower_pt, _, _ = result
-        thickness = upper_pt[1] - lower_pt[1]
+        _, y_center, thickness = info
         if thickness >= min_thickness:
-            y_center = (upper_pt[1] + lower_pt[1]) / 2.0
             valid.append((x, y_center, thickness))
 
     if not valid:
@@ -102,9 +211,12 @@ def find_lightening_holes(coords, fore_spar_x, aft_spar_x,
     if x_end <= x_start:
         return []
 
+    # Pre-compute surface split once for all queries
+    query = Geometry.create_surface_query(coords)
+
     def _max_diam_at(x_frac):
         """Max hole diameter that fits inside the offset shell at *x_frac*."""
-        info = Geometry.compute_spar_center(coords, min(x_frac, 0.999))
+        info = query(min(x_frac, 0.999))
         if info is None:
             return 0.0
         _, _, thickness = info
@@ -148,7 +260,7 @@ def find_lightening_holes(coords, fore_spar_x, aft_spar_x,
             if diam <= 0:
                 valid = False
                 break
-            info = Geometry.compute_spar_center(coords, cx)
+            info = query(cx)
             if info is None:
                 valid = False
                 break
@@ -158,3 +270,40 @@ def find_lightening_holes(coords, fore_spar_x, aft_spar_x,
             return holes
 
     return []
+
+
+def compute_pin_positions(coords, spar_positions, split_frac, pin_diam_norm):
+    """
+    Compute alignment pin positions at ~15% and ~85% chord.
+
+    Avoids placing pins within 1.5x pin-diameter of a spar center or
+    beyond the CS split line. Returns list of (x, y_center) in
+    normalised [0..1] space.
+    """
+    targets = [0.15, 0.85]
+    max_x = split_frac if split_frac and 0 < split_frac < 1 else 0.999
+    pins = []
+
+    # Build exclusion zones around spar centers
+    exclusions = []
+    spar_radius_margin = pin_diam_norm * 1.5
+    for sx, _, _ in (spar_positions or []):
+        exclusions.append((sx - spar_radius_margin, sx + spar_radius_margin))
+
+    for tx in targets:
+        if tx >= max_x:
+            continue
+        # Check exclusion zones
+        blocked = any(lo <= tx <= hi for lo, hi in exclusions)
+        if blocked:
+            continue
+        info = Geometry.compute_spar_center(coords, min(tx, 0.999))
+        if info is None:
+            continue
+        _, cy, thickness = info
+        # Pin must fit inside the airfoil with some margin
+        if thickness < pin_diam_norm * 2.0:
+            continue
+        pins.append((tx, cy))
+
+    return pins

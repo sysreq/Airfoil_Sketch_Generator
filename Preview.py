@@ -13,6 +13,8 @@ import zlib
 import math
 import os
 
+import Geometry
+
 
 # -- Colors -------------------------------------------------------------------
 
@@ -21,6 +23,13 @@ _CLR_AIRFOIL     = (30, 60, 120)
 _CLR_OFFSET      = (100, 140, 200)
 _CLR_SPLIT       = (200, 50, 50)
 _CLR_SPAR        = (50, 160, 50)
+_CLR_WING        = (80, 130, 180)
+_CLR_WING_FILL   = (200, 215, 235)
+_CLR_CS_FILL     = (230, 180, 180)
+
+# Mapping constants for _norm_to_pixel: vertical center and scale
+_Y_CENTER_FRAC = 0.57   # Y=0 at 57% from top (camber bias)
+_Y_SCALE = 2.85         # vertical stretch to fill drawing area
 
 
 # -- Canvas -------------------------------------------------------------------
@@ -38,10 +47,7 @@ class Canvas:
 
     def fill(self, r, g, b, a=255):
         pixel = bytes((r, g, b, a))
-        row = pixel * self.width
-        for y in range(self.height):
-            offset = y * self.width * 4
-            self._buf[offset:offset + self.width * 4] = row
+        self._buf[:] = pixel * (self.width * self.height)
 
     def set_pixel(self, x, y, r, g, b, a=255):
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -194,7 +200,7 @@ def _write_png(width, height, rgba_buf):
         raw_rows.extend(rgba_buf[start:start + row_bytes])
 
     # IDAT: zlib-compressed scanlines
-    compressed = zlib.compress(bytes(raw_rows), 6)
+    compressed = zlib.compress(bytes(raw_rows), 1)
     idat = _make_chunk(b"IDAT", compressed)
 
     # IEND
@@ -211,35 +217,46 @@ def _norm_to_pixel(x_norm, y_norm, width, height, margin):
 
     X maps left to right across (width - 2*margin).
     Y is flipped (airfoil Y-up to pixel Y-down) and centered vertically.
-    Airfoil Y typically spans about [-0.06 .. 0.12] for a NACA 0012.
-    We map Y range [-0.15 .. 0.20] to fill the vertical space.
     """
     draw_w = width - 2 * margin
     draw_h = height - 2 * margin
 
     px = margin + x_norm * draw_w
-    # Center Y=0 at 57% from top (airfoils have more camber on upper surface)
-    py = margin + draw_h * 0.57 - y_norm * draw_h * 2.85
+    py = margin + draw_h * _Y_CENTER_FRAC - y_norm * draw_h * _Y_SCALE
     return px, py
 
 
-def _coords_to_pixels(coords, width, height, margin):
+def _coords_to_pixels(coords, width, height, margin, ox=0, oy=0):
     """Convert a list of normalised (x,y) tuples to pixel coords."""
-    return [_norm_to_pixel(x, y, width, height, margin) for x, y in coords]
+    if ox == 0 and oy == 0:
+        return [_norm_to_pixel(x, y, width, height, margin) for x, y in coords]
+    return [(px + ox, py + oy)
+            for px, py in (_norm_to_pixel(x, y, width, height, margin)
+                           for x, y in coords)]
 
 
 # -- Main Render Functions ----------------------------------------------------
 
-def render_preview(coords, chord_cm=10.0, enable_split=False, split_pct=75.0,
-                   enable_offset=False, offset_mm=2.0, enable_spars=False,
-                   spars=None, enable_lightening=False, lightening_holes=None,
+def render_preview(coords, chord_cm=10.0, split_pct=0.0,
+                   spars=None, lightening_holes=None,
                    cs_coords=None, offset_pts=None,
-                   width=360, height=180):
+                   wing=None, width=360, height=180):
     """
     Render a preview PNG of the airfoil with optional features.
 
     All geometry inputs (coords, offset_pts, spars, lightening_holes,
     cs_coords) are in NORMALIZED [0..1] space.
+
+    Parameters
+    ----------
+    split_pct : float
+        Chord split percentage; 0 means no split.
+    spars, lightening_holes, cs_coords, offset_pts :
+        Pass None to disable each feature (presence implies enabled).
+    wing : dict or None
+        When provided, draws a planform view. Expected keys:
+        half_span_mm, tip_chord_mm, sweep_deg, sections,
+        mirror, solid, cs_inboard_pct, cs_outboard_pct.
 
     Returns PNG bytes.
     """
@@ -247,82 +264,322 @@ def render_preview(coords, chord_cm=10.0, enable_split=False, split_pct=75.0,
     canvas.fill(*_CLR_BACKGROUND)
 
     margin = 12
+    half_span = wing["half_span_mm"] if wing else 0.0
 
-    # Main airfoil contour
-    if coords:
-        pixels = _coords_to_pixels(coords, width, height, margin)
-        canvas.draw_polyline(pixels, _CLR_AIRFOIL, thickness=2, closed=True)
-
-    # Offset contour
-    if enable_offset and offset_pts:
-        off_pixels = _coords_to_pixels(offset_pts, width, height, margin)
-        canvas.draw_polyline(off_pixels, _CLR_OFFSET, thickness=1, closed=True)
-
-    # Control surface contour
-    if cs_coords:
-        cs_pixels = _coords_to_pixels(cs_coords, width, height, margin)
-        canvas.draw_polyline(cs_pixels, _CLR_AIRFOIL, thickness=2, closed=True)
-
-    # Split line
-    if enable_split and coords:
-        split_x = split_pct / 100.0
-        # Find approximate upper and lower Y at split position by scanning coords
-        upper_y, lower_y = _find_surface_y(coords, split_x)
-        px0, py0 = _norm_to_pixel(split_x, upper_y, width, height, margin)
-        px1, py1 = _norm_to_pixel(split_x, lower_y, width, height, margin)
-        canvas.draw_line(int(round(px0)), int(round(py0)),
-                         int(round(px1)), int(round(py1)),
-                         _CLR_SPLIT, thickness=1)
-
-    # Spar circles
-    if enable_spars and spars:
-        for cx, cy, thickness in spars:
-            px, py = _norm_to_pixel(cx, cy, width, height, margin)
-            # Radius in pixels: thickness/2 scaled like Y
-            draw_h = height - 2 * margin
-            r_px = (thickness / 2.0) * draw_h * 2.85
-            canvas.draw_circle(px, py, r_px, _CLR_SPAR, thickness=1)
-
-    # Lightening holes
-    if enable_lightening and lightening_holes:
-        for cx, cy, diam in lightening_holes:
-            px, py = _norm_to_pixel(cx, cy, width, height, margin)
-            draw_h = height - 2 * margin
-            r_px = (diam / 2.0) * draw_h * 2.85
-            canvas.draw_circle(px, py, r_px, _CLR_SPAR, thickness=1)
+    if wing and half_span > 0:
+        # Split canvas: left half = airfoil cross-section, right half = planform
+        half_w = width // 2
+        _draw_cross_section(canvas, coords, split_pct,
+                            offset_pts, cs_coords, spars,
+                            lightening_holes, 0, 0, half_w, height, margin)
+        _draw_planform(canvas, chord_cm,
+                       half_span,
+                       wing["tip_chord_mm"],
+                       wing["sweep_deg"],
+                       half_w, 0, half_w, height, margin,
+                       wing.get("sections", 2),
+                       wing.get("mirror", False),
+                       wing.get("solid", False),
+                       split_pct=split_pct,
+                       cs_inboard_pct=wing.get("cs_inboard_pct", 0.0),
+                       cs_outboard_pct=wing.get("cs_outboard_pct", 0.0))
+    else:
+        _draw_cross_section(canvas, coords, split_pct,
+                            offset_pts, cs_coords, spars,
+                            lightening_holes, 0, 0, width, height, margin)
 
     return canvas.to_png_bytes()
 
 
+def _draw_cross_section(canvas, coords, split_pct, offset_pts, cs_coords,
+                        spars, lightening_holes, ox, oy, w, h, margin):
+    """Draw the airfoil cross-section view within a sub-region of the canvas."""
+    # Main airfoil contour
+    if coords:
+        pixels = _coords_to_pixels(coords, w, h, margin, ox, oy)
+        canvas.draw_polyline(pixels, _CLR_AIRFOIL, thickness=2, closed=True)
+
+    # Offset contour
+    if offset_pts:
+        off_pixels = _coords_to_pixels(offset_pts, w, h, margin, ox, oy)
+        canvas.draw_polyline(off_pixels, _CLR_OFFSET, thickness=1, closed=True)
+
+    # Control surface contour
+    if cs_coords:
+        cs_pixels = _coords_to_pixels(cs_coords, w, h, margin, ox, oy)
+        canvas.draw_polyline(cs_pixels, _CLR_AIRFOIL, thickness=2, closed=True)
+
+    # Split line
+    if split_pct > 0 and coords:
+        split_x = split_pct / 100.0
+        upper_y, lower_y = _find_surface_y(coords, split_x)
+        px0, py0 = _norm_to_pixel(split_x, upper_y, w, h, margin)
+        px1, py1 = _norm_to_pixel(split_x, lower_y, w, h, margin)
+        canvas.draw_line(int(round(px0 + ox)), int(round(py0 + oy)),
+                         int(round(px1 + ox)), int(round(py1 + oy)),
+                         _CLR_SPLIT, thickness=1)
+
+    # Spar circles
+    if spars:
+        draw_h = h - 2 * margin
+        for cx, cy, thickness in spars:
+            px, py = _norm_to_pixel(cx, cy, w, h, margin)
+            r_px = (thickness / 2.0) * draw_h * _Y_SCALE
+            canvas.draw_circle(px + ox, py + oy, r_px, _CLR_SPAR, thickness=1)
+
+    # Lightening holes
+    if lightening_holes:
+        draw_h = h - 2 * margin
+        for cx, cy, diam in lightening_holes:
+            px, py = _norm_to_pixel(cx, cy, w, h, margin)
+            r_px = (diam / 2.0) * draw_h * _Y_SCALE
+            canvas.draw_circle(px + ox, py + oy, r_px, _CLR_SPAR, thickness=1)
+
+
+def _planform_to_pixel(x_mm, y_span_mm, ox, oy, w, h, margin,
+                       root_chord_mm, half_span_mm, sweep_offset_mm):
+    """
+    Map planform mm coords to pixel coords within a sub-region.
+
+    x_mm:       chordwise position (0 = LE, root_chord_mm = TE)
+    y_span_mm:  spanwise position (0 = root, half_span_mm = tip)
+    ox, oy:     pixel origin of the sub-region
+    w, h:       sub-region dimensions in pixels
+    """
+    draw_w = w - 2 * margin
+    draw_h = h - 2 * margin
+
+    # Total chordwise extent includes sweep offset
+    extent_x = max(root_chord_mm, abs(sweep_offset_mm) + root_chord_mm,
+                   sweep_offset_mm + root_chord_mm)
+    min_x = min(0.0, sweep_offset_mm)
+    extent_x = extent_x - min_x
+
+    # Scale to fit both halves (mirrored planform: total span = 2 * half_span)
+    total_span = 2.0 * half_span_mm
+    if extent_x <= 0 or total_span <= 0:
+        return ox + margin, oy + margin
+
+    scale = min(draw_w / extent_x, draw_h / total_span) * 0.90
+
+    # Center horizontally and vertically
+    used_w = extent_x * scale
+    used_h = total_span * scale
+    pad_x = (draw_w - used_w) / 2.0
+    pad_y = (draw_h - used_h) / 2.0
+
+    px = ox + margin + pad_x + (x_mm - min_x) * scale
+    # y_span_mm=0 is root (center), positive goes up in the top half
+    # In pixel space, root is at vertical center, tip-top is above, tip-bottom below
+    py = oy + margin + pad_y + (half_span_mm - y_span_mm) * scale
+    return px, py
+
+
+def _fill_quad(canvas, quad, color):
+    """
+    Fill a convex quadrilateral with a solid color using scanline fill.
+
+    quad: list of 4 (px, py) vertices in order.
+    """
+    r, g, b = color
+    # Find vertical pixel bounds
+    ys = [p[1] for p in quad]
+    y_min = int(math.floor(min(ys)))
+    y_max = int(math.ceil(max(ys)))
+    y_min = max(0, y_min)
+    y_max = min(canvas.height - 1, y_max)
+
+    n = len(quad)
+    for y in range(y_min, y_max + 1):
+        # Find all x-intercepts of this scanline with the polygon edges
+        xs = []
+        for i in range(n):
+            x0, y0 = quad[i]
+            x1, y1 = quad[(i + 1) % n]
+            if y0 == y1:
+                continue
+            if (y0 <= y < y1) or (y1 <= y < y0):
+                t = (y - y0) / (y1 - y0)
+                xs.append(x0 + t * (x1 - x0))
+        if len(xs) >= 2:
+            xs.sort()
+            x_start = int(round(xs[0]))
+            x_end = int(round(xs[-1]))
+            x_start = max(0, x_start)
+            x_end = min(canvas.width - 1, x_end)
+            for x in range(x_start, x_end + 1):
+                canvas.set_pixel(x, y, r, g, b)
+
+
+def _draw_dashed_line(canvas, p0, p1, color, dash=6, gap=4):
+    """Draw a dashed line from p0 to p1."""
+    x0, y0 = p0
+    x1, y1 = p1
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+    if length < 1:
+        return
+    step = dash + gap
+    pos = 0.0
+    while pos < length:
+        seg_end = min(pos + dash, length)
+        frac_s = pos / length
+        frac_e = seg_end / length
+        sx = int(round(x0 + dx * frac_s))
+        sy = int(round(y0 + dy * frac_s))
+        ex = int(round(x0 + dx * frac_e))
+        ey = int(round(y0 + dy * frac_e))
+        canvas.draw_line(sx, sy, ex, ey, color, thickness=1)
+        pos += step
+
+
+def _draw_planform(canvas, chord_cm, half_span_mm, tip_chord_mm,
+                   sweep_deg, ox, oy, w, h, margin,
+                   sections=2, mirror=False, solid=False,
+                   split_pct=0.0,
+                   cs_inboard_pct=0.0, cs_outboard_pct=0.0):
+    """
+    Draw a mirrored top-down planform view within a sub-region.
+
+    Root chord is drawn at the vertical center; both wing halves extend
+    up and down from it.
+
+    sections:  number of span-wise loft sections (>=2); intermediate
+               section lines are drawn at evenly spaced span stations.
+    mirror:    when True, draw a dashed center line to indicate the
+               mirror/symmetry plane.
+    solid:     when True, fill the planform with _CLR_WING_FILL;
+               when False, outline only.
+    split_pct: chord split percentage; 0 means no split.
+    cs_inboard_pct / cs_outboard_pct:  CS span extents as fractions [0..1]
+               of half-span.  When split_pct > 0 and outboard > inboard,
+               draws the CS region, hinge line, and boundary lines.
+    """
+    root_chord_mm = chord_cm * 10.0  # cm -> mm
+    if half_span_mm <= 0 or root_chord_mm <= 0:
+        return
+
+    sweep_offset_mm = half_span_mm * math.tan(math.radians(sweep_deg))
+
+    def _to_px(x_mm, y_span_mm):
+        return _planform_to_pixel(x_mm, y_span_mm, ox, oy, w, h, margin,
+                                  root_chord_mm, half_span_mm,
+                                  sweep_offset_mm)
+
+    # Root chord (center, y_span=0)
+    root_le = _to_px(0.0, 0.0)
+    root_te = _to_px(root_chord_mm, 0.0)
+
+    # Right wing (top half, positive y_span)
+    tip_le_r = _to_px(sweep_offset_mm, half_span_mm)
+    tip_te_r = _to_px(sweep_offset_mm + tip_chord_mm, half_span_mm)
+
+    # Left wing (bottom half, negative y_span — mirror)
+    tip_le_l = _to_px(sweep_offset_mm, -half_span_mm)
+    tip_te_l = _to_px(sweep_offset_mm + tip_chord_mm, -half_span_mm)
+
+    # Fill planform with solid color when solid mode is enabled
+    if solid:
+        right_outline = [root_le, tip_le_r, tip_te_r, root_te]
+        left_outline = [root_le, tip_le_l, tip_te_l, root_te]
+        _fill_quad(canvas, right_outline, _CLR_WING_FILL)
+        _fill_quad(canvas, left_outline, _CLR_WING_FILL)
+
+    # Draw outlines
+    right_outline = [root_le, tip_le_r, tip_te_r, root_te]
+    canvas.draw_polyline(right_outline, _CLR_WING, thickness=2, closed=True)
+
+    left_outline = [root_le, tip_le_l, tip_te_l, root_te]
+    canvas.draw_polyline(left_outline, _CLR_WING, thickness=2, closed=True)
+
+    # Section lines at intermediate span stations
+    sections = max(2, sections)
+    if sections > 2:
+        for i in range(1, sections):
+            frac = i / float(sections)
+            span_y = frac * half_span_mm
+            sweep_at = frac * sweep_offset_mm
+            chord_at = root_chord_mm + frac * (tip_chord_mm - root_chord_mm)
+            le = _to_px(sweep_at, span_y)
+            te = _to_px(sweep_at + chord_at, span_y)
+            canvas.draw_line(int(round(le[0])), int(round(le[1])),
+                             int(round(te[0])), int(round(te[1])),
+                             _CLR_WING, thickness=1)
+            # Mirror side
+            le_m = _to_px(sweep_at, -span_y)
+            te_m = _to_px(sweep_at + chord_at, -span_y)
+            canvas.draw_line(int(round(le_m[0])), int(round(le_m[1])),
+                             int(round(te_m[0])), int(round(te_m[1])),
+                             _CLR_WING, thickness=1)
+
+    # Control surface span region
+    if split_pct > 0 and cs_outboard_pct > cs_inboard_pct:
+        split_frac = split_pct / 100.0
+        ib = cs_inboard_pct   # fraction of half-span
+        ob = cs_outboard_pct  # fraction of half-span
+
+        for sign in (1.0, -1.0):
+            ib_span = ib * half_span_mm * sign
+            ob_span = ob * half_span_mm * sign
+
+            # Chord and sweep offset at each station
+            ib_frac = ib
+            ob_frac = ob
+            sweep_ib = ib_frac * sweep_offset_mm
+            sweep_ob = ob_frac * sweep_offset_mm
+            chord_ib = root_chord_mm + ib_frac * (tip_chord_mm - root_chord_mm)
+            chord_ob = root_chord_mm + ob_frac * (tip_chord_mm - root_chord_mm)
+
+            # Hinge (split) x position at each station
+            hinge_x_ib = sweep_ib + split_frac * chord_ib
+            hinge_x_ob = sweep_ob + split_frac * chord_ob
+
+            # Trailing edge x at each station
+            te_x_ib = sweep_ib + chord_ib
+            te_x_ob = sweep_ob + chord_ob
+
+            # Four corners of the CS trapezoid (hinge-to-TE, ib-to-ob)
+            p_hinge_ib = _to_px(hinge_x_ib, ib_span)
+            p_te_ib = _to_px(te_x_ib, ib_span)
+            p_te_ob = _to_px(te_x_ob, ob_span)
+            p_hinge_ob = _to_px(hinge_x_ob, ob_span)
+
+            # Fill the CS region
+            _fill_quad(canvas, [p_hinge_ib, p_te_ib, p_te_ob, p_hinge_ob],
+                       _CLR_CS_FILL)
+
+            # Hinge line (dashed, from inboard to outboard)
+            _draw_dashed_line(canvas, p_hinge_ib, p_hinge_ob, _CLR_SPLIT,
+                              dash=4, gap=3)
+
+            # Chord-wise boundary at inboard station
+            canvas.draw_line(int(round(p_hinge_ib[0])), int(round(p_hinge_ib[1])),
+                             int(round(p_te_ib[0])), int(round(p_te_ib[1])),
+                             _CLR_SPLIT, thickness=1)
+            # Chord-wise boundary at outboard station
+            canvas.draw_line(int(round(p_hinge_ob[0])), int(round(p_hinge_ob[1])),
+                             int(round(p_te_ob[0])), int(round(p_te_ob[1])),
+                             _CLR_SPLIT, thickness=1)
+
+    # Root chord line (emphasized)
+    canvas.draw_line(int(round(root_le[0])), int(round(root_le[1])),
+                     int(round(root_te[0])), int(round(root_te[1])),
+                     _CLR_AIRFOIL, thickness=2)
+
+    # Dashed center line when mirror mode is active
+    if mirror:
+        _draw_dashed_line(canvas, root_le, root_te, _CLR_SPLIT,
+                          dash=6, gap=4)
+
+
 def _find_surface_y(coords, x_frac):
-    """
-    Find approximate upper and lower Y at a given X fraction by
-    scanning the coordinate list. Returns (upper_y, lower_y).
-    """
-    best_upper = 0.0
-    best_lower = 0.0
-    best_dist = float("inf")
-    found = False
-
-    for i in range(len(coords) - 1):
-        x0, y0 = coords[i]
-        x1, y1 = coords[i + 1]
-        if x0 == x1:
-            continue
-        if (x0 - x_frac) * (x1 - x_frac) <= 0:
-            t = (x_frac - x0) / (x1 - x0)
-            y = y0 + t * (y1 - y0)
-            if not found:
-                best_upper = y
-                best_lower = y
-                found = True
-            else:
-                if y > best_upper:
-                    best_upper = y
-                if y < best_lower:
-                    best_lower = y
-
-    return (best_upper, best_lower)
+    """Find upper and lower Y at a given X fraction. Returns (upper_y, lower_y)."""
+    result = Geometry.find_upper_lower_at(coords, x_frac)
+    if result is None:
+        return (0.0, 0.0)
+    _, upper_pt, _, lower_pt, _, _ = result
+    return (upper_pt[1], lower_pt[1])
 
 
 # -- Simple airfoil shape for icons -------------------------------------------
@@ -415,8 +672,37 @@ def render_icon(icon_type, width=300, height=60):
             thickness = upper_y - lower_y
             px, py = _norm_to_pixel(spar_x, cy, width, height, margin)
             draw_h = height - 2 * margin
-            r_px = (thickness / 2.0) * draw_h * 2.85 * 0.6
+            r_px = (thickness / 2.0) * draw_h * _Y_SCALE * 0.6
             canvas.draw_circle(px, py, r_px, _CLR_SPAR, thickness=1)
+
+    elif icon_type == "wing":
+        # Simplified planform trapezoid icon
+        draw_w = width - 2 * margin
+        draw_h = height - 2 * margin
+        cx_mid = width / 2.0
+        cy_mid = height / 2.0
+        # Root chord (horizontal, centered)
+        root_half = draw_w * 0.35
+        # Tip chord (shorter, offset for sweep)
+        tip_half = draw_w * 0.18
+        span_half = draw_h * 0.38
+        sweep_px = draw_w * 0.06  # slight sweep offset
+        # Right half
+        r_pts = [
+            (cx_mid - root_half, cy_mid),
+            (cx_mid - tip_half + sweep_px, cy_mid - span_half),
+            (cx_mid + tip_half + sweep_px, cy_mid - span_half),
+            (cx_mid + root_half, cy_mid),
+        ]
+        canvas.draw_polyline(r_pts, _CLR_WING, thickness=2, closed=True)
+        # Left half (mirror)
+        l_pts = [
+            (cx_mid - root_half, cy_mid),
+            (cx_mid - tip_half + sweep_px, cy_mid + span_half),
+            (cx_mid + tip_half + sweep_px, cy_mid + span_half),
+            (cx_mid + root_half, cy_mid),
+        ]
+        canvas.draw_polyline(l_pts, _CLR_WING, thickness=2, closed=True)
 
     return canvas.to_png_bytes()
 

@@ -9,6 +9,8 @@ No Fusion 360 dependencies — only os and json.
 import json
 import os
 
+EMPTY_LOCAL = "(no local airfoils - add .dat files to the data/ folder)"
+
 
 # -- .dat File Parsing ---------------------------------------------------------
 

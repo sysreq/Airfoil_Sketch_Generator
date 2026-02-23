@@ -9,6 +9,7 @@ Pure Python — only math. No Fusion 360 dependencies.
 import math
 
 _EPSILON = 1e-12
+MM_PER_CM = 10.0
 
 
 # -- Point / Contour Helpers ---------------------------------------------------
@@ -108,6 +109,31 @@ def compute_spar_center(coords, chord_frac):
     _, upper_pt, _, lower_pt, _, _ = result
     y_upper, y_lower = upper_pt[1], lower_pt[1]
     return (chord_frac, (y_upper + y_lower) / 2.0, y_upper - y_lower)
+
+
+def create_surface_query(coords):
+    """Return a query(x_frac) function using pre-computed surface split.
+
+    Avoids re-splitting the contour on every call, which is significant
+    when scanning many chord positions (e.g. spar placement).
+
+    The returned function takes an x_frac in (0, 1) and returns
+    (x_frac, y_center, thickness) or None.
+    """
+    _, upper_seg, lower_seg = _split_surfaces(coords)
+
+    def query(x_frac):
+        if x_frac <= 0.0 or x_frac >= 1.0:
+            return None
+        _, upper_pt = _find_crossing(upper_seg, x_frac)
+        _, lower_pt = _find_crossing(lower_seg, x_frac)
+        if upper_pt is None or lower_pt is None:
+            return None
+        y_center = (upper_pt[1] + lower_pt[1]) / 2.0
+        thickness = upper_pt[1] - lower_pt[1]
+        return (x_frac, y_center, thickness)
+
+    return query
 
 
 # -- Control Surface -----------------------------------------------------------
@@ -225,6 +251,147 @@ def _fillet_corner(p_prev, p_corner, p_next, radius, n_arc=8):
          cy + radius * math.sin(a1 + da * i / n_arc))
         for i in range(n_arc + 1)
     ]
+
+
+def extract_main_body(coords, split_frac):
+    """
+    Extract the closed contour of the main body (the portion of the
+    airfoil forward of *split_frac*).
+
+    Returns a list of (x, y) tuples tracing:
+        upper_split -> upper surface -> LE -> lower surface -> lower_split
+
+    Returns None if the split cannot be computed.
+    """
+    result = find_upper_lower_at(coords, split_frac)
+    if result is None:
+        return None
+
+    j, upper_pt, k, lower_pt, upper_seg, lower_seg = result
+
+    # upper_seg[j:] is near-split -> LE (X decreasing).
+    # Prepend the exact split point.
+    main_upper = [upper_pt] + list(upper_seg[j:])
+
+    # lower_seg[:k] is LE -> near-split (X increasing).
+    # Append the exact split point only if it isn't already there.
+    if lower_seg[:k] and _pts_equal(lower_seg[k - 1], lower_pt):
+        main_lower = list(lower_seg[:k])
+    else:
+        main_lower = list(lower_seg[:k]) + [lower_pt]
+
+    return main_upper + main_lower
+
+
+def extract_living_hinge_contour(coords, split_frac, skin_thickness_norm):
+    """
+    Extract main body, control surface, and living-hinge strip contours.
+
+    A living hinge keeps the CS attached to the main body via a thin
+    strip on the **upper** surface. The **lower** surface has a full gap
+    (identical to the existing split behaviour).
+
+    Parameters
+    ----------
+    coords : list of (x, y)
+        Normalised [0..1] closed airfoil contour (Selig order: upper TE ->
+        LE -> lower TE).
+    split_frac : float
+        Chordwise split position as a fraction of chord [0..1].
+    skin_thickness_norm : float
+        Thickness of the hinge strip in normalised chord units.  Typical
+        physical values are 0.3-0.5 mm; divide by chord_mm to normalise.
+
+    Returns
+    -------
+    (main_contour, cs_contour, hinge_contour) or None if the split cannot
+    be computed.
+
+    main_contour : list of (x, y)
+        The forward portion of the airfoil up to the split line on both
+        surfaces, with the upper surface trimmed to the hinge-strip
+        boundary.
+    cs_contour : list of (x, y)
+        The aft portion of the airfoil, from the lower split point up the
+        lower surface, around the TE, and back along the upper surface to
+        the upper split point.
+    hinge_contour : list of (x, y)
+        A thin rectangular strip on the upper surface bridging the gap
+        between main body and CS at the split line.
+    """
+    result = find_upper_lower_at(coords, split_frac)
+    if result is None:
+        return None
+
+    j_up, upper_split_pt, k_lo, lower_split_pt, upper_seg, lower_seg = result
+
+    # ---- Hinge strip boundaries ----
+    # The hinge strip sits on the upper surface centred at the split X.
+    # Its forward edge is at split_frac, its aft edge at
+    # split_frac + skin_thickness_norm (a tiny sliver).
+    hinge_aft_x = split_frac + skin_thickness_norm
+
+    # Find the upper-surface point at the aft edge of the hinge
+    j_hinge, upper_hinge_pt = _find_crossing(upper_seg, hinge_aft_x)
+    if upper_hinge_pt is None:
+        # Hinge strip doesn't fit — fall back to a zero-width strip
+        upper_hinge_pt = upper_split_pt
+        j_hinge = j_up
+
+    # Lower-surface point at hinge_aft_x (for the bottom edge of the strip)
+    # We need the Y position on the upper surface projected down by
+    # skin_thickness_norm.  The hinge strip is a thin rectangle:
+    #   top-left     = upper_split_pt
+    #   top-right    = upper_hinge_pt
+    #   bottom-right = (upper_hinge_pt.x, upper_hinge_pt.y - skin_thickness_norm)
+    #   bottom-left  = (upper_split_pt.x, upper_split_pt.y - skin_thickness_norm)
+    hinge_bot_left = (upper_split_pt[0],
+                      upper_split_pt[1] - skin_thickness_norm)
+    hinge_bot_right = (upper_hinge_pt[0],
+                       upper_hinge_pt[1] - skin_thickness_norm)
+
+    # ---- Hinge contour (rectangular strip) ----
+    hinge_contour = [
+        upper_split_pt,
+        upper_hinge_pt,
+        hinge_bot_right,
+        hinge_bot_left,
+    ]
+
+    # ---- Main body contour ----
+    # Upper surface: from the upper split point forward to the LE, then
+    # along the lower surface back to the lower split point.
+    # upper_seg is TE -> LE (X decreasing).
+    # We want split_pt -> LE, which is upper_seg[j_up:] (already X-decreasing
+    # starting near split).
+    main_upper = [upper_split_pt] + list(upper_seg[j_up:])
+    # lower_seg is LE -> TE (X increasing).  We want LE -> split.
+    main_lower = list(lower_seg[:k_lo]) + [lower_split_pt]
+
+    main_contour = main_upper + main_lower
+
+    # ---- CS contour ----
+    # The CS is the aft portion.  On the upper surface the CS starts at the
+    # hinge aft edge (upper_hinge_pt) and runs to the TE.
+    # upper_seg[:j_hinge] is TE -> near hinge_aft_x (X decreasing).
+    # Reverse to get hinge_aft -> TE.
+    cs_upper = [upper_hinge_pt] + list(reversed(upper_seg[:j_hinge]))
+
+    # Lower surface aft of split: lower_seg[k_lo:] is split -> TE.
+    # Reverse to get TE -> split.
+    rev_lower = list(reversed(lower_seg[k_lo:]))
+    if rev_lower and _pts_equal(rev_lower[-1], lower_split_pt):
+        cs_lower = rev_lower
+    else:
+        cs_lower = rev_lower + [lower_split_pt]
+
+    # Combine: upper_hinge -> TE (upper) + TE -> split (lower)
+    if cs_upper and cs_lower and _pts_equal(cs_upper[-1], cs_lower[0]):
+        cs_contour = cs_upper + cs_lower[1:]
+    else:
+        cs_contour = cs_upper + cs_lower
+
+    return main_contour, cs_contour, hinge_contour
 
 
 def round_cs_wall_corners(contour, radius_norm, n_arc=8):

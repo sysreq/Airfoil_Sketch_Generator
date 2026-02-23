@@ -12,7 +12,7 @@ import Geometry
 import Offset
 import Infill
 
-MM_PER_CM = 10.0
+MM_PER_CM = Geometry.MM_PER_CM
 
 
 def draw_polyline(sketch, contour, chord_cm, closed=True):

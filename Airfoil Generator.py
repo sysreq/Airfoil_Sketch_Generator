@@ -25,7 +25,7 @@ import traceback
 import adsk.core
 import adsk.fusion
 
-_EMPTY_LOCAL = "(no local airfoils - add .dat files to the data/ folder)"
+_EMPTY_LOCAL = None  # set from Airfoils.EMPTY_LOCAL after import
 
 _app      = None
 _handlers = []
@@ -36,6 +36,8 @@ Infill    = None
 Preview   = None
 Drawing   = None
 GUI       = None
+Wing      = None
+Extrude   = None
 
 
 # -- Fusion 360 Dialog ---------------------------------------------------------
@@ -102,8 +104,10 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
             enable_offset = cfg["enable_offset"]
             offset_mm     = cfg["offset_mm"]
             enable_hinge  = cfg["enable_hinge"]
+            hinge_type    = cfg.get("hinge_type", "CA Hinge")
             hinge_h_mm    = cfg["hinge_slot_height_mm"]
             hinge_d_mm    = cfg["hinge_slot_depth_mm"]
+            cs_hinge_thick_mm = cfg.get("cs_hinge_thickness_mm", 0.4)
             cs_inset_mm   = cfg["cs_inset_mm"]
             enable_spars  = cfg["enable_spars"]
             spar_diam_mm  = cfg["spar_diameter_mm"]
@@ -133,32 +137,13 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
 
             Drawing.draw_polyline(sketch, coords, chord_cm)
 
-            # ---- spar positions (computed before offset for truncation) ----
+            # ---- shared 2D geometry pipeline ----
+            geom = Infill.compute_2d_geometry(coords, cfg)
+            spars = geom["spars"]
+            spar_trunc = geom["spar_trunc"]
+
             spar_info = ""
             lightening_info = ""
-            spars = []
-            if enable_spars:
-                chord_mm = chord_cm * Drawing.MM_PER_CM
-                max_x = (split_pct / 100.0
-                         if enable_split and 0 < split_pct < 100
-                         else 1.0)
-                # Enforce minimum 2mm gap between aft spar edge and hinge
-                if enable_split and enable_hinge and 0 < split_pct < 100:
-                    min_hinge_gap_mm = 2.0
-                    shortfall = max(0.0, min_hinge_gap_mm - spar_clr_mm)
-                    max_x -= shortfall / chord_mm
-                spars = Infill.find_optimal_spar_positions(
-                    coords,
-                    spar_diam_cm / chord_cm,
-                    spar_clr_mm / chord_mm,
-                    max_x,
-                )
-
-            # ---- inner offset (truncated at fore spar when available) ----
-            spar_trunc = None
-            if enable_spars and spars:
-                cx, cy, _ = spars[0]  # fore spar
-                spar_trunc = (cx, cy, spar_diam_cm / chord_cm / 2.0)
 
             if enable_offset and offset_mm > 0:
                 Drawing.draw_offset(
@@ -188,6 +173,68 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                     enable_hinge, hinge_h_mm, hinge_d_mm, cs_inset_mm,
                 )
 
+            # ---- 3D wing extrusion ----
+            wing_info = ""
+            enable_wing = cfg.get("enable_wing", False)
+            if enable_wing:
+                issues = Wing.validate_wing(
+                    coords,
+                    half_span_mm=cfg.get("wing_half_span_mm", 500.0),
+                    root_chord_mm=chord_cm * Drawing.MM_PER_CM,
+                    tip_chord_mm=cfg.get("wing_tip_chord_mm", 100.0),
+                    spar_diam_mm=spar_diam_mm if enable_spars else 0,
+                    clearance_mm=spar_clr_mm if enable_spars else 0,
+                    sweep_deg=cfg.get("wing_sweep_deg", 0.0),
+                    dihedral_deg=cfg.get("wing_dihedral_deg", 0.0),
+                    twist_deg=cfg.get("wing_twist_deg", 0.0),
+                    n_sections=cfg.get("wing_sections", 2),
+                )
+
+                errors = [msg for sev, msg in issues if sev == "error"]
+                warnings = [msg for sev, msg in issues if sev == "warning"]
+
+                if errors:
+                    _app.userInterface.messageBox(
+                        "Wing validation errors:\n\n"
+                        + "\n".join(f"  \u2022 {e}" for e in errors)
+                    )
+                else:
+                    proceed = True
+                    if warnings:
+                        result = _app.userInterface.messageBox(
+                            "Wing validation warnings:\n\n"
+                            + "\n".join(f"  \u2022 {w}" for w in warnings)
+                            + "\n\nContinue anyway?",
+                            "Wing Warnings",
+                            adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+                        )
+                        proceed = (result == adsk.core.DialogResults.DialogYes)
+
+                    if proceed:
+                        wing_info, wing_body = Extrude.create_wing(
+                            _app, root, coords, cfg,
+                        )
+
+                        # ---- 3D control surface (separate body) ----
+                        cs_body = None
+                        is_solid = cfg.get("wing_solid_loft", False)
+                        cs_inb = cfg.get("cs_inboard_pct", 10.0)
+                        cs_outb = cfg.get("cs_outboard_pct", 90.0)
+                        if (enable_split and 0 < split_pct < 100
+                                and cs_outb > cs_inb):
+                            cs_info, cs_body = Extrude.create_control_surface(
+                                _app, root, coords, cfg,
+                                wing_body=(wing_body if is_solid else None),
+                            )
+                            wing_info += cs_info
+
+                        # ---- Mirror all bodies after boolean ops ----
+                        if cfg.get("wing_mirror", False):
+                            mirror_list = [b for b in [wing_body, cs_body]
+                                           if b is not None]
+                            if mirror_list:
+                                Extrude.mirror_bodies(root, mirror_list)
+
             # ---- summary ----
             _app.userInterface.messageBox(
                 f'Sketch created: "{sketch.name}"\n'
@@ -197,25 +244,11 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
                 f"{spar_info}"
                 f"{lightening_info}"
                 f"{split_info}"
+                f"{wing_info}"
             )
 
             # ---- persist settings for next run ----
-            Airfoils.save_config(self._script_dir, {
-                "airfoil": selected_name,
-                "chord_cm": chord_cm,
-                "enable_split": enable_split,
-                "split_pct": split_pct,
-                "enable_hinge": enable_hinge,
-                "hinge_slot_height_mm": hinge_h_mm,
-                "hinge_slot_depth_mm": hinge_d_mm,
-                "cs_inset_mm": cs_inset_mm,
-                "enable_offset": enable_offset,
-                "offset_mm": offset_mm,
-                "enable_spars": enable_spars,
-                "spar_diameter_mm": spar_diam_mm,
-                "spar_clearance_mm": spar_clr_mm,
-                "enable_lightening": enable_light,
-            })
+            Airfoils.save_config(self._script_dir, cfg)
 
         except Exception:
             _app.userInterface.messageBox(
@@ -226,8 +259,8 @@ class AirfoilCommandExecuteHandler(adsk.core.CommandEventHandler):
 # -- Entry Point ---------------------------------------------------------------
 
 def run(context):
-    global _app, _handlers
-    global Airfoils, Geometry, Offset, Infill, Preview, Drawing, GUI
+    global _app, _handlers, _EMPTY_LOCAL
+    global Airfoils, Geometry, Offset, Infill, Preview, Drawing, GUI, Wing, Extrude
     _handlers = []
 
     try:
@@ -245,21 +278,27 @@ def run(context):
 
         # Reload modules on every run so code changes take effect without
         # restarting Fusion 360.  Order matters: Geometry before Infill
-        # (Infill imports Geometry), Offset before Drawing (Drawing imports
-        # Offset), Preview before GUI, and all geometry modules before Drawing.
+        # and Wing (both import Geometry), Offset before Drawing (Drawing
+        # imports Offset), Wing and Infill before Extrude (Extrude imports
+        # both), Preview before GUI, and all geometry modules before Drawing.
         import Airfoils
         import Geometry
         import Offset
         import Infill
+        import Wing
         import Preview
         import Drawing
+        import Extrude
         import GUI
         importlib.reload(Airfoils)
+        _EMPTY_LOCAL = Airfoils.EMPTY_LOCAL
         importlib.reload(Geometry)
         importlib.reload(Offset)
         importlib.reload(Infill)
+        importlib.reload(Wing)
         importlib.reload(Preview)
         importlib.reload(Drawing)
+        importlib.reload(Extrude)
         importlib.reload(GUI)
 
         GUI.init(_app, {
@@ -268,6 +307,8 @@ def run(context):
             "Infill": Infill,
             "Preview": Preview,
             "Drawing": Drawing,
+            "Wing": Wing,
+            "Extrude": Extrude,
         })
 
         data_dir = os.path.join(script_dir, "data")
